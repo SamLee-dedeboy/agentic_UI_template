@@ -1,11 +1,8 @@
 use clap::Parser;
 use serde_json::json;
 
-mod claude_binary;
-mod commands;
 mod core;
 mod examples;
-mod process;
 mod web_server;
 
 #[derive(Parser)]

@@ -6,7 +6,6 @@ use axum::{
     routing::get,
     Router,
 };
-use chrono;
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -18,7 +17,6 @@ use tower_http::cors::{Any, CorsLayer};
 use tower_http::services::ServeDir;
 use which;
 
-use crate::commands;
 
 // Find Claude binary for web mode - use bundled binary first
 fn find_claude_binary_web() -> Result<String, String> {
@@ -241,12 +239,6 @@ pub struct ClaudeExecutionRequest {
     pub extra: ClaudeExtraArgs,
 }
 
-#[derive(Deserialize)]
-pub struct QueryParams {
-    #[serde(default)]
-    pub project_path: Option<String>,
-}
-
 #[derive(Serialize)]
 pub struct ApiResponse<T> {
     pub success: bool,
@@ -278,23 +270,6 @@ async fn serve_frontend() -> Html<&'static str> {
 }
 
 /// API endpoint to get projects (equivalent to Tauri command)
-async fn get_projects() -> Json<ApiResponse<Vec<commands::claude::Project>>> {
-    match commands::claude::list_projects().await {
-        Ok(projects) => Json(ApiResponse::success(projects)),
-        Err(e) => Json(ApiResponse::error(e.to_string())),
-    }
-}
-
-/// API endpoint to get sessions for a project
-async fn get_sessions(
-    Path(project_id): Path<String>,
-) -> Json<ApiResponse<Vec<commands::claude::Session>>> {
-    match commands::claude::get_project_sessions(project_id).await {
-        Ok(sessions) => Json(ApiResponse::success(sessions)),
-        Err(e) => Json(ApiResponse::error(e.to_string())),
-    }
-}
-
 /// List conversations owned by the requesting guest cookie (newest first).
 async fn list_conversations(
     AxumState(state): AxumState<AppState>,
@@ -438,109 +413,6 @@ async fn dispatch_client_tool(
     }
 }
 
-/// Simple agents endpoint - return empty for now (needs DB state)
-async fn get_agents() -> Json<ApiResponse<Vec<serde_json::Value>>> {
-    Json(ApiResponse::success(vec![]))
-}
-
-/// Simple usage endpoint - return empty for now
-async fn get_usage() -> Json<ApiResponse<Vec<serde_json::Value>>> {
-    Json(ApiResponse::success(vec![]))
-}
-
-/// Get Claude settings - return basic defaults for web mode
-async fn get_claude_settings() -> Json<ApiResponse<serde_json::Value>> {
-    let default_settings = serde_json::json!({
-        "data": {
-            "model": "claude-3-5-sonnet-20241022",
-            "max_tokens": 8192,
-            "temperature": 0.0,
-            "auto_save": true,
-            "theme": "dark"
-        }
-    });
-    Json(ApiResponse::success(default_settings))
-}
-
-/// Check Claude version - return mock status for web mode
-async fn check_claude_version() -> Json<ApiResponse<serde_json::Value>> {
-    let version_status = serde_json::json!({
-        "status": "ok",
-        "version": "web-mode",
-        "message": "Running in web server mode"
-    });
-    Json(ApiResponse::success(version_status))
-}
-
-/// List all available Claude installations on the system
-async fn list_claude_installations(
-) -> Json<ApiResponse<Vec<crate::claude_binary::ClaudeInstallation>>> {
-    let installations = crate::claude_binary::discover_claude_installations();
-
-    if installations.is_empty() {
-        Json(ApiResponse::error(
-            "No Claude Code installations found on the system".to_string(),
-        ))
-    } else {
-        Json(ApiResponse::success(installations))
-    }
-}
-
-/// Get system prompt - return default for web mode
-async fn get_system_prompt() -> Json<ApiResponse<String>> {
-    let default_prompt =
-        "You are Claude, an AI assistant created by Anthropic. You are running in web server mode."
-            .to_string();
-    Json(ApiResponse::success(default_prompt))
-}
-
-/// Open new session - mock for web mode
-async fn open_new_session() -> Json<ApiResponse<String>> {
-    let session_id = format!("web-session-{}", chrono::Utc::now().timestamp());
-    Json(ApiResponse::success(session_id))
-}
-
-/// List slash commands - return empty for web mode
-async fn list_slash_commands() -> Json<ApiResponse<Vec<serde_json::Value>>> {
-    Json(ApiResponse::success(vec![]))
-}
-
-/// MCP list servers - return empty for web mode
-async fn mcp_list() -> Json<ApiResponse<Vec<serde_json::Value>>> {
-    Json(ApiResponse::success(vec![]))
-}
-
-/// Load session history from JSONL file
-async fn load_session_history(
-    Path((session_id, project_id)): Path<(String, String)>,
-) -> Json<ApiResponse<Vec<serde_json::Value>>> {
-    match commands::claude::load_session_history(session_id, project_id).await {
-        Ok(history) => Json(ApiResponse::success(history)),
-        Err(e) => Json(ApiResponse::error(e.to_string())),
-    }
-}
-
-/// List running Claude sessions
-async fn list_running_claude_sessions() -> Json<ApiResponse<Vec<serde_json::Value>>> {
-    // Return empty for web mode - no actual Claude processes in web mode
-    Json(ApiResponse::success(vec![]))
-}
-
-/// Execute Claude code - mock for web mode
-async fn execute_claude_code() -> Json<ApiResponse<serde_json::Value>> {
-    Json(ApiResponse::error("Claude execution is not available in web mode. Please use the desktop app for running Claude commands.".to_string()))
-}
-
-/// Continue Claude code - mock for web mode
-async fn continue_claude_code() -> Json<ApiResponse<serde_json::Value>> {
-    Json(ApiResponse::error("Claude execution is not available in web mode. Please use the desktop app for running Claude commands.".to_string()))
-}
-
-/// Resume Claude code - mock for web mode  
-async fn resume_claude_code() -> Json<ApiResponse<serde_json::Value>> {
-    Json(ApiResponse::error("Claude execution is not available in web mode. Please use the desktop app for running Claude commands.".to_string()))
-}
-
 /// Cancel a running Claude subprocess by session ID. Looks up the mpsc
 /// cancel channel registered by the spawn function and sends on it; the
 /// spawn task picks the signal up via `tokio::select!`, calls `start_kill()`
@@ -567,15 +439,6 @@ async fn cancel_claude_execution(
             session_id
         ))),
     }
-}
-
-/// Get Claude session output
-async fn get_claude_session_output(Path(sessionId): Path<String>) -> Json<ApiResponse<String>> {
-    // In web mode, output is streamed via WebSocket, not stored
-    println!("[TRACE] Output request for session: {}", sessionId);
-    Json(ApiResponse::success(
-        "Output available via WebSocket only".to_string(),
-    ))
 }
 
 /// WebSocket handler for Claude execution with streaming output
@@ -1696,15 +1559,17 @@ pub async fn create_web_server(
         .allow_methods([Method::GET, Method::POST, Method::PUT, Method::DELETE])
         .allow_headers(Any);
 
-    // Create router with API endpoints
+    // Router surface the template actually uses. Everything else is the
+    // fork's to add. Kept deliberately narrow: customer-facing apps don't
+    // want to expose project pickers, session history APIs, or anything
+    // else that leaks host state.
     let app = Router::new()
-        // Frontend routes
+        // Serve the Vite build.
         .route("/", get(serve_frontend))
         .route("/index.html", get(serve_frontend))
-        // API routes (REST API equivalent of Tauri commands)
-        .route("/api/projects", get(get_projects))
-        .route("/api/projects/{project_id}/sessions", get(get_sessions))
-        // Guest-scoped conversation history.
+        // Guest-scoped conversation history (persisted under the signed
+        // cookie; not yet consumed by the frontend — kept for forks that
+        // want to wire history-replay in `useClaudeSession`).
         .route("/api/conversations", get(list_conversations))
         .route(
             "/api/conversations/{conversation_id}/messages",
@@ -1713,43 +1578,15 @@ pub async fn create_web_server(
         // Internal: called by the tool-bridge subprocess via loopback only.
         // Protected by the per-spawn X-Tool-Bridge-Secret header.
         .route("/__tools/dispatch", axum::routing::post(tools_dispatch))
-        .route("/api/agents", get(get_agents))
-        .route("/api/usage", get(get_usage))
-        // Settings and configuration
-        .route("/api/settings/claude", get(get_claude_settings))
-        .route("/api/settings/claude/version", get(check_claude_version))
-        .route(
-            "/api/settings/claude/installations",
-            get(list_claude_installations),
-        )
-        .route("/api/settings/system-prompt", get(get_system_prompt))
-        // Session management
-        .route("/api/sessions/new", get(open_new_session))
-        // Slash commands
-        .route("/api/slash-commands", get(list_slash_commands))
-        // MCP
-        .route("/api/mcp/servers", get(mcp_list))
-        // Session history
-        .route(
-            "/api/sessions/{session_id}/history/{project_id}",
-            get(load_session_history),
-        )
-        .route("/api/sessions/running", get(list_running_claude_sessions))
-        // Claude execution endpoints (read-only in web mode)
-        .route("/api/sessions/execute", get(execute_claude_code))
-        .route("/api/sessions/continue", get(continue_claude_code))
-        .route("/api/sessions/resume", get(resume_claude_code))
+        // Cancel a running turn from the browser (used by
+        // `useClaudeSession.cancel` + `reset`).
         .route(
             "/api/sessions/{sessionId}/cancel",
             get(cancel_claude_execution),
         )
-        .route(
-            "/api/sessions/{sessionId}/output",
-            get(get_claude_session_output),
-        )
-        // WebSocket endpoint for real-time Claude execution
+        // WebSocket endpoint for real-time Claude execution.
         .route("/ws/claude", get(claude_websocket))
-        // Serve static assets
+        // Serve static assets.
         .nest_service("/assets", ServeDir::new("../dist/assets"))
         .nest_service("/vite.svg", ServeDir::new("../dist/vite.svg"))
         .layer(cors)

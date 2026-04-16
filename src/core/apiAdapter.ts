@@ -2,68 +2,24 @@
  * Web-only API adapter for the template.
  *
  * Two surfaces:
- *  - {@link apiCall}: REST for one-shot commands, WebSocket for streaming ones.
- *    The command-name input mirrors the old Tauri-style string so that forks
- *    carrying opcode-derived code don't have to rename call sites.
- *  - Session-scoped `CustomEvent`s on `window`: the streaming path dispatches
- *    `claude-output:<sessionId>`, `claude-error:<sessionId>`,
- *    `claude-complete:<sessionId>`, and `claude-cancelled:<sessionId>` so
- *    concurrent sessions don't cross-contaminate. Generic versions (without
- *    the `:<id>` suffix) are also dispatched for simple single-session UIs.
+ *  - {@link apiCall}: opens a WebSocket for one of the streaming Claude
+ *    commands (`execute_claude_code` / `continue_claude_code` /
+ *    `resume_claude_code`) and resolves when the turn completes.
+ *  - Session-scoped `CustomEvent`s on `window`: the streaming path
+ *    dispatches `claude-output:<sessionId>`, `claude-error:<sessionId>`,
+ *    `claude-complete:<sessionId>`, `claude-cancelled:<sessionId>`, and
+ *    `claude-tool-call:<sessionId>` so concurrent sessions don't
+ *    cross-contaminate. Generic versions (without the `:<id>` suffix)
+ *    are also dispatched for simple single-session UIs.
  *
  * Keep this file small — feature modules should build their own typed
- * wrappers in `src/features/<name>/api.ts` on top of `apiCall`.
+ * wrappers on top of `apiCall` and the named helpers below.
  */
 
 export interface ApiResponse<T> {
   success: boolean;
   data?: T;
   error?: string;
-}
-
-/** One-shot REST call against the Axum backend. */
-async function restApiCall<T>(endpoint: string, params?: Record<string, unknown>): Promise<T> {
-  let processed = endpoint;
-  const pathParamKeys = new Set<string>();
-  if (params) {
-    for (const key of Object.keys(params)) {
-      const variants = [
-        `{${key}}`,
-        `{${key.charAt(0).toLowerCase() + key.slice(1)}}`,
-        `{${key.charAt(0).toUpperCase() + key.slice(1)}}`,
-      ];
-      for (const v of variants) {
-        if (processed.includes(v)) {
-          processed = processed.replace(v, encodeURIComponent(String(params[key])));
-          pathParamKeys.add(key);
-        }
-      }
-    }
-  }
-
-  const url = new URL(processed, window.location.origin);
-  if (params) {
-    for (const [k, v] of Object.entries(params)) {
-      if (pathParamKeys.has(k)) continue;
-      if (v == null) continue;
-      url.searchParams.append(k, String(v));
-    }
-  }
-
-  const res = await fetch(url.toString(), {
-    method: "GET",
-    headers: authHeaders(),
-  });
-  if (!res.ok) throw new Error(`HTTP ${res.status} ${res.statusText}`);
-  const body = (await res.json()) as ApiResponse<T>;
-  if (!body.success) throw new Error(body.error ?? "API call failed");
-  return body.data as T;
-}
-
-/** Optional `Authorization: Bearer <token>` header from a global set via Phase 3. */
-function authHeaders(): Record<string, string> {
-  const token = (globalThis as any).__APP_AUTH_TOKEN;
-  return token ? { "Content-Type": "application/json", Authorization: `Bearer ${token}` } : { "Content-Type": "application/json" };
 }
 
 const STREAMING_COMMANDS = new Set([
@@ -75,8 +31,8 @@ const STREAMING_COMMANDS = new Set([
 // Map of live session ID → its WebSocket. We keep one entry per session
 // so `resolveClientToolCall` can find the right socket to reply on when a
 // client-tool result is ready. Entries are added on open and removed on
-// close. This lives at module scope because tool resolution happens
-// outside the `apiCall` Promise that opened the socket.
+// close. Module scope because tool resolution happens outside the
+// `apiCall` Promise that opened the socket.
 const liveSessionSockets = new Map<string, WebSocket>();
 
 /**
@@ -124,46 +80,20 @@ export function closeSession(sessionId: string): void {
 }
 
 /**
- * Unified dispatch. Pass the Tauri-style command name and the request params;
- * streaming commands open a WebSocket, non-streaming ones hit REST.
+ * Open a streaming Claude session over WebSocket. Resolves when the run
+ * completes (success or failure); use the session-scoped `CustomEvent`s
+ * to consume the intermediate stream-json.
  */
-export async function apiCall<T>(command: string, params?: Record<string, unknown>): Promise<T> {
-  if (STREAMING_COMMANDS.has(command)) {
-    return handleStreamingCommand<T>(command, params);
-  }
-  return restApiCall<T>(mapCommandToEndpoint(command), params);
-}
-
-/**
- * Tauri-style command → REST endpoint. Only the subset the backend actually
- * serves today is listed; anything else falls through with a warning so forks
- * notice missing endpoints early.
- */
-function mapCommandToEndpoint(command: string): string {
-  const table: Record<string, string> = {
-    list_projects: "/api/projects",
-    get_project_sessions: "/api/projects/{projectId}/sessions",
-    get_claude_settings: "/api/settings/claude",
-    check_claude_version: "/api/settings/claude/version",
-    list_claude_installations: "/api/settings/claude/installations",
-    get_system_prompt: "/api/settings/system-prompt",
-    open_new_session: "/api/sessions/new",
-    load_session_history: "/api/sessions/{sessionId}/history/{projectId}",
-    list_running_claude_sessions: "/api/sessions/running",
-    list_slash_commands: "/api/slash-commands",
-    mcp_list: "/api/mcp/servers",
-    cancel_claude_execution: "/api/sessions/{sessionId}/cancel",
-    get_claude_session_output: "/api/sessions/{sessionId}/output",
-  };
-  const endpoint = table[command];
-  if (!endpoint) {
-    console.warn(
-      `[apiAdapter] unknown command '${command}'; the backend has no REST endpoint for it. ` +
-        `Add one in backend/src/web_server.rs or route through a feature-specific api module.`,
+export async function apiCall<T>(
+  command: string,
+  params?: Record<string, unknown>,
+): Promise<T> {
+  if (!STREAMING_COMMANDS.has(command)) {
+    throw new Error(
+      `[apiAdapter] unknown command '${command}'. The template only wires streaming commands (${[...STREAMING_COMMANDS].join(", ")}). Forks that need non-streaming endpoints should add their own helpers in src/features/<name>/api.ts.`,
     );
-    return `/api/unknown/${command}`;
   }
-  return endpoint;
+  return handleStreamingCommand<T>(command, params);
 }
 
 /** Internal: stream Claude output over WebSocket and synthesize session-scoped events. */

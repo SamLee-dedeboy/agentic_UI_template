@@ -26,29 +26,19 @@ chrono = { version = "0.4", features = ["serde"] }
 anyhow = "1"
 log = "0.4"
 env_logger = "0.11"
-regex = "1"
-glob = "0.3"
-base64 = "0.22"
-libc = "0.2"
 reqwest = { version = "0.12", features = ["json", "native-tls-vendored"] }
 futures = "0.3"
-async-trait = "0.1"
+futures-util = "0.3"
 tempfile = "3"
 which = "7"
 sha2 = "0.10"
 hmac = "0.12"
 subtle = "2"          # constant-time comparison for the cookie HMAC check
-zstd = "0.13"
 uuid = { version = "1.6", features = ["v4", "serde"] }
-walkdir = "2"
-serde_yaml = "0.9"
 axum = { version = "0.8", features = ["ws"] }
 tower = "0.5"
 tower-http = { version = "0.6", features = ["fs", "cors"] }
 clap = { version = "4.0", features = ["derive"] }
-futures-util = "0.3"
-# Pin image to avoid edition2024 requirement
-image = "=0.25.1"
 
 [profile.release]
 strip = true

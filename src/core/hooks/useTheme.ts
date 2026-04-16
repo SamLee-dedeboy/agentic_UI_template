@@ -11,9 +11,9 @@ import { useEffect, useState } from "react";
  *    keeps the user's preference.
  *  - If the user hasn't made a choice, we honour `prefers-color-scheme`.
  *
- * Forks that want more palettes (e.g. the `theme-gray` / `theme-white`
- * variants already defined in styles.css) can extend the Theme type and
- * this hook; the toggle UI is in `ThemeToggle.tsx`.
+ * Forks that want more palettes can add `.theme-<name>` blocks to
+ * styles.css alongside the existing `.theme-light` and extend the Theme
+ * type + this hook. The toggle UI is in `ThemeToggle.tsx`.
  */
 export type Theme = "dark" | "light";
 
