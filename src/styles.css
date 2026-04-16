@@ -260,9 +260,8 @@ html {
   border-color: var(--color-border);
 }
 
-html {
-  color-scheme: dark;
-}
+/* `color-scheme` is set dynamically by the `useTheme` hook so native
+   widgets (scrollbars, form controls) match the active theme. */
 
 body {
   background-color: var(--color-background);

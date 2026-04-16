@@ -1,10 +1,31 @@
 <!doctype html>
-<html lang="en" class="dark">
+<html lang="en">
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <meta name="color-scheme" content="dark" />
-    <title>opcode - Claude Code Session Browser</title>
+    <title>Claude UI Template</title>
+    <script>
+      // Apply the persisted theme before React mounts to avoid a
+      // flash-of-wrong-theme. Mirrors the logic in useTheme.ts —
+      // keep the two in sync if you add more themes.
+      (function () {
+        try {
+          var stored = localStorage.getItem("ui-theme");
+          var prefersLight =
+            stored == null &&
+            window.matchMedia &&
+            window.matchMedia("(prefers-color-scheme: light)").matches;
+          var theme =
+            stored === "light" || stored === "dark"
+              ? stored
+              : prefersLight
+              ? "light"
+              : "dark";
+          if (theme === "light") document.documentElement.classList.add("theme-light");
+          document.documentElement.style.colorScheme = theme;
+        } catch (_) {}
+      })();
+    </script>
   </head>
 
   <body>

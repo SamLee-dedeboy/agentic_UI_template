@@ -1,67 +1,106 @@
-# Welcome Contributors
+# Contributing
 
-We welcome contributions to enhance opcode's capabilities and improve its performance. To report bugs, create a [GitHub issue](https://github.com/getAsterisk/opcode/issues).
+Thanks for considering a contribution to the claude-ui template.
 
-> Before contributing, read through the existing issues and pull requests to see if someone else is already working on something similar. That way you can avoid duplicating efforts.
+Before starting, scan existing issues and PRs so you don't duplicate
+in-flight work.
 
-To contribute, please follow these steps:
+## Workflow
 
-1. Fork the opcode repository on GitHub.
-2. Create a new branch for your feature or bug fix.
-3. Make your changes and ensure that the code passes all tests.
-4. Submit a pull request describing your changes and their benefits.
+1. Fork the repo.
+2. Branch off `main`.
+3. Make your changes. Keep them tightly scoped — one concern per PR.
+4. Ensure `bun run check` passes (typecheck + `cargo check`) and any
+   tests relevant to the area you touched still pass (`cargo test`).
+5. Open a PR with a clear description of the problem, the approach, and
+   any caveats.
 
-## Pull Request Guidelines
+## PR guidelines
 
-When submitting a pull request, please follow these guidelines:
-
-1. **Title**: Please include following prefixes:
+1. **Title prefix** — one of:
    - `Feature:` for new features
    - `Fix:` for bug fixes
-   - `Docs:` for documentation changes
-   - `Refactor:` for code refactoring
-   - `Improve:` for performance improvements
-   - `Other:` for other changes
+   - `Docs:` for docs-only changes
+   - `Refactor:` for code reorganization
+   - `Improve:` for perf or UX polish
+   - `Other:` for everything else
 
-   For example:
-   - `Feature: added custom agent timeout configuration`
-   - `Fix: resolved session list scrolling issue`
+   Examples: `Feature: add seat-map client tool`, `Fix: reset doesn't cancel running session`.
 
-2. **Description**: Provide a clear and detailed description of your changes in the pull request. Explain the problem you are solving, the approach you took, and any potential side effects or limitations of your changes.
+2. **Description** — state what's broken (or missing), what you
+   changed, and anything a reviewer should watch for.
 
-3. **Documentation**: Update the relevant documentation to reflect your changes. This includes the README file, code comments, and any other relevant documentation.
+3. **Docs** — if behavior changes, update the affected READMEs
+   ([main](README.md), [docs/README.md](docs/README.md),
+   [docs/tools.md](docs/tools.md), [CLAUDE.md](CLAUDE.md),
+   [src/core/README.md](src/core/README.md)) in the same PR.
 
-4. **Dependencies**: If your changes require new dependencies, ensure that they are properly documented and added to the `package.json` or `Cargo.toml` files.
+4. **Dependencies** — justify any new package; prefer stdlib / existing
+   deps where possible. Track new deps in `package.json` /
+   `backend/Cargo.toml`.
 
-5. If the pull request does not meet the above guidelines, it may be closed without merging.
+## Local testing
 
-**Note**: Please ensure that you have the latest version of the code before creating a pull request. If you have an existing fork, just sync your fork with the latest version of the opcode repository.
+Commands you'll use most:
 
-## Coding Standards
+```bash
+bun run check              # typecheck + cargo check
+bun run build              # production frontend build
+cd backend && cargo test   # Rust unit tests (core + examples)
+cd backend && cargo fmt    # before committing Rust
+```
 
-### Frontend (React/TypeScript)
-- Use TypeScript for all new code
-- Follow functional components with hooks
-- Use Tailwind CSS for styling
-- Add JSDoc comments for exported functions and components
+Manual UI smoke: after any change, run the backend (`cargo run --bin
+claude-ui-app`), open http://localhost:1420 in dev mode (`bun run dev`)
+or :8080 in prod, and click through the three example prompts. Client
+tool round-trips (the color picker, the flight picker) are the most
+fragile path — always hit them end-to-end.
+
+> **After editing backend Rust code**: stop the running backend (Ctrl+C),
+> `cargo build --bins`, restart, and click "New chat" in the UI. The
+> running process keeps its binary mmapped and won't pick up rebuilds;
+> old Claude context inside an ongoing chat caches tool results and
+> masks behavior changes.
+
+## Coding standards
+
+### Frontend (TypeScript / React 19)
+
+- TypeScript for all new code; no `any` without a justifying comment.
+- Functional components + hooks. No class components.
+- Tailwind for styling, using existing design tokens (`bg-card`,
+  `text-muted-foreground`, etc.) — don't introduce new color values
+  unless the theme file is updated alongside.
+- Build against `@/core/*` primitives (`useClaudeSession`, `<ChatView>`,
+  `<Markdown>`, the tool registries) rather than calling `apiAdapter`
+  directly from components or re-implementing tool-call routing.
+- JSDoc comments for exported functions and components when the WHY
+  isn't obvious from the code.
 
 ### Backend (Rust)
-- Follow Rust standard conventions
-- Use `cargo fmt` for formatting
-- Use `cargo clippy` for linting
-- Handle all `Result` types explicitly
-- Add comprehensive documentation with `///` comments
 
-### Security Requirements
-- Validate all inputs from the frontend
-- Use prepared statements for database operations
-- Never log sensitive data (tokens, passwords, etc.)
-- Use secure defaults for all configurations
+- Follow `rustfmt` defaults; run `cargo fmt` before committing.
+- Handle all `Result` types explicitly — no silent `.unwrap()` in
+  production paths.
+- Add `///` docs for public items in `core::tools`, `web_server`, and
+  anything on the fork-visible API surface.
+- New server tools go in `backend/src/examples/` (or the fork's own
+  module) and are wired through `backend/src/main.rs`.
+
+### Security
+
+- Validate all inputs that cross an external boundary (HTTP, WS, MCP).
+- Use parameterized queries for SQLite — never string-interpolate SQL.
+- Never log secrets (`APP_SESSION_KEY`, bearer tokens, bridge secrets,
+  etc.).
+- Preserve the customer-app defaults: `--tools ""`, no
+  `--dangerously-skip-permissions` unless `APP_ALLOW_SKIP_PERMISSIONS=1`.
 
 ## Testing
-- Add tests for new functionality
-- Ensure all existing tests pass
-- Run `cargo test` for Rust code
-- Test the application manually before submitting
 
-Please adhere to the coding conventions, maintain clear documentation, and provide thorough testing for your contributions. 
+- Add unit tests for new Rust helpers — examples in
+  `backend/src/examples/flights.rs` and `backend/src/core/tools.rs`.
+- For behavior that spans frontend + backend (a new tool), add at least
+  a Rust-side dispatch test; frontend components can be exercised
+  manually through the chat UI.
+- Ensure existing tests pass (`cargo test`, `bun run check`).
