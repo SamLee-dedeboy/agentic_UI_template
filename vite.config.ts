@@ -24,20 +24,12 @@ export default defineConfig({
     },
   },
   build: {
-    chunkSizeWarningLimit: 1000,
+    chunkSizeWarningLimit: 1500,
     rollupOptions: {
       output: {
         manualChunks: {
           "react-vendor": ["react", "react-dom"],
-          "ui-vendor": [
-            "@radix-ui/react-dialog",
-            "@radix-ui/react-dropdown-menu",
-            "@radix-ui/react-select",
-            "@radix-ui/react-tabs",
-            "@radix-ui/react-tooltip",
-            "@radix-ui/react-switch",
-            "@radix-ui/react-popover",
-          ],
+          "vega-vendor": ["vega", "vega-lite", "react-vega"],
         },
       },
     },

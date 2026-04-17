@@ -37,3 +37,9 @@ CLAUDE.md
 .claude/
 
 .env
+
+# Python (data_server/)
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/

@@ -1,9 +1,10 @@
 use axum::extract::ws::{Message, WebSocket};
-use axum::http::Method;
+use axum::extract::{DefaultBodyLimit, Multipart};
+use axum::http::{Method, StatusCode};
 use axum::{
     extract::{Path, State as AxumState, WebSocketUpgrade},
-    response::{Html, Json, Response},
-    routing::get,
+    response::{Html, IntoResponse, Json, Response},
+    routing::{get, post},
     Router,
 };
 use futures_util::{SinkExt, StreamExt};
@@ -16,6 +17,8 @@ use tokio::sync::Mutex;
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::services::ServeDir;
 use which;
+
+use crate::core::datasets::{DatasetBinding, DatasetRecord, DatasetStore};
 
 
 // Find Claude binary for web mode - use bundled binary first
@@ -93,6 +96,10 @@ pub struct AppState {
     // The loopback URL the tool-bridge should POST to. Derived from the
     // `host:port` passed to `create_web_server`.
     pub self_url: String,
+    // Uploaded datasets (keyed by cookie for ownership checks) + the
+    // per-session binding that tells the Claude spawn path which dataset,
+    // if any, to attach the Python MCP sidecar for.
+    pub datasets: DatasetStore,
 }
 
 #[derive(Debug, Deserialize, Default, Clone)]
@@ -411,6 +418,352 @@ async fn dispatch_client_tool(
             name
         )),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Dataset upload + session binding.
+// ---------------------------------------------------------------------------
+
+/// Hard cap on the in-memory list of columns we return to the frontend.
+/// Wider datasets still upload, but the UI chip only surfaces the first
+/// 200 (the full set remains queryable via SQL).
+const MAX_COLUMNS_IN_RESPONSE: usize = 200;
+
+/// Multipart upload endpoint: reads a single `file` part, persists it to
+/// `$TMPDIR/claude-ui-ds-<id>.<ext>`, parses the schema + a 5-row
+/// sample, and registers a `DatasetRecord` owned by the requesting
+/// guest cookie. Returns the id + schema so the frontend can render a
+/// chip and later bind the dataset to a session.
+async fn upload_dataset(
+    AxumState(state): AxumState<AppState>,
+    axum::Extension(guest): axum::Extension<crate::core::cookies::GuestSession>,
+    mut multipart: Multipart,
+) -> Response {
+    let mut file_bytes: Option<(String, Vec<u8>)> = None;
+    loop {
+        match multipart.next_field().await {
+            Ok(Some(field)) => {
+                if field.name() == Some("file") {
+                    let filename = field
+                        .file_name()
+                        .map(String::from)
+                        .unwrap_or_else(|| "upload.csv".to_string());
+                    match field.bytes().await {
+                        Ok(bytes) => {
+                            file_bytes = Some((filename, bytes.to_vec()));
+                            break;
+                        }
+                        Err(e) => {
+                            return (
+                                StatusCode::BAD_REQUEST,
+                                Json(json!({
+                                    "success": false,
+                                    "error": format!("reading upload body: {e}")
+                                })),
+                            )
+                                .into_response();
+                        }
+                    }
+                }
+            }
+            Ok(None) => break,
+            Err(e) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({
+                        "success": false,
+                        "error": format!("reading multipart: {e}")
+                    })),
+                )
+                    .into_response();
+            }
+        }
+    }
+
+    let (filename, bytes) = match file_bytes {
+        Some(v) => v,
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "success": false,
+                    "error": "expected a 'file' field in the multipart upload"
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    // Detect format from the extension. Default to CSV.
+    let lower = filename.to_ascii_lowercase();
+    let format: &str = if lower.ends_with(".json") {
+        "json"
+    } else if lower.ends_with(".csv") || lower.ends_with(".tsv") {
+        "csv"
+    } else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "success": false,
+                "error": "only .csv and .json uploads are supported"
+            })),
+        )
+            .into_response();
+    };
+
+    let dataset_id = uuid::Uuid::new_v4().simple().to_string();
+    let ext = if format == "json" { "json" } else { "csv" };
+    let tmp_path = std::env::temp_dir().join(format!("claude-ui-ds-{}.{}", dataset_id, ext));
+    if let Err(e) = std::fs::write(&tmp_path, &bytes) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({
+                "success": false,
+                "error": format!("writing dataset temp file: {e}")
+            })),
+        )
+            .into_response();
+    }
+
+    let parse_result = if format == "json" {
+        crate::core::datasets::parse_json_array(&tmp_path)
+    } else {
+        crate::core::datasets::parse_csv(&tmp_path)
+    };
+    let (mut columns, row_count, sample_rows) = match parse_result {
+        Ok(t) => t,
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp_path);
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "success": false,
+                    "error": format!("could not parse {format}: {e}")
+                })),
+            )
+                .into_response();
+        }
+    };
+    if columns.len() > MAX_COLUMNS_IN_RESPONSE {
+        columns.truncate(MAX_COLUMNS_IN_RESPONSE);
+    }
+
+    let record = DatasetRecord {
+        dataset_id: dataset_id.clone(),
+        path: tmp_path,
+        format: format.to_string(),
+        filename: filename.clone(),
+        columns: columns.clone(),
+        row_count,
+        sample_rows: sample_rows.clone(),
+        cookie_id: guest.id.clone(),
+    };
+    state.datasets.insert(record).await;
+
+    Json(json!({
+        "success": true,
+        "data": {
+            "dataset_id": dataset_id,
+            "filename": filename,
+            "format": format,
+            "row_count": row_count,
+            "columns": columns,
+            "sample_rows": sample_rows,
+        }
+    }))
+    .into_response()
+}
+
+#[derive(Debug, Deserialize)]
+struct BindDatasetBody {
+    session_id: String,
+    dataset_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct UnbindDatasetBody {
+    session_id: String,
+}
+
+/// Drop a session's dataset binding. Called by the frontend on "New
+/// chat". The underlying DatasetRecord is preserved so the user can
+/// rebind it elsewhere.
+async fn unbind_dataset(
+    AxumState(state): AxumState<AppState>,
+    axum::Extension(_guest): axum::Extension<crate::core::cookies::GuestSession>,
+    Json(body): Json<UnbindDatasetBody>,
+) -> Json<ApiResponse<()>> {
+    state.datasets.unbind(&body.session_id).await;
+    Json(ApiResponse::success(()))
+}
+
+/// Bind an uploaded dataset to a chat session. The Claude spawn code
+/// reads this mapping to decide whether to attach the Python MCP sidecar.
+/// Ownership is enforced by the guest cookie; a caller can only bind a
+/// dataset their own cookie uploaded.
+async fn bind_dataset(
+    AxumState(state): AxumState<AppState>,
+    axum::Extension(guest): axum::Extension<crate::core::cookies::GuestSession>,
+    Json(body): Json<BindDatasetBody>,
+) -> Json<ApiResponse<()>> {
+    let record = match state
+        .datasets
+        .get_owned(&body.dataset_id, &guest.id)
+        .await
+    {
+        Some(r) => r,
+        None => {
+            return Json(ApiResponse::error(
+                "dataset not found or not owned by this guest".into(),
+            ));
+        }
+    };
+    let binding = DatasetBinding {
+        dataset_id: record.dataset_id,
+        path: record.path,
+        format: record.format,
+        filename: record.filename,
+        columns: record.columns,
+        row_count: record.row_count,
+    };
+    state.datasets.bind(&body.session_id, binding).await;
+    Json(ApiResponse::success(()))
+}
+
+/// A guard returned by [`prepare_python_bridge`]. Holds the two
+/// tempfiles that back the MCP config + the data-server config. Dropping
+/// it removes them from disk. Keep one live for the entire Claude
+/// subprocess lifetime.
+struct PythonBridgeHandle {
+    mcp_config_path: std::path::PathBuf,
+    allowed_tools: Vec<String>,
+    system_prompt: String,
+    _data_server_config_file: tempfile::NamedTempFile,
+    _mcp_config_file: tempfile::NamedTempFile,
+}
+
+fn resolve_python_bin() -> Result<String, String> {
+    if let Ok(p) = std::env::var("APP_PYTHON_BINARY") {
+        return Ok(p);
+    }
+    for candidate in ["python3", "python"] {
+        if which::which(candidate).is_ok() {
+            return Ok(candidate.to_string());
+        }
+    }
+    Err(
+        "python3 not found on PATH. Install Python 3.10+ and \
+         `pip install -r data_server/requirements.txt`, or set APP_PYTHON_BINARY."
+            .to_string(),
+    )
+}
+
+fn resolve_data_server_script() -> Result<std::path::PathBuf, String> {
+    if let Ok(p) = std::env::var("APP_DATA_SERVER_SCRIPT") {
+        let pb = std::path::PathBuf::from(p);
+        if pb.exists() {
+            return Ok(pb);
+        }
+        return Err(format!(
+            "APP_DATA_SERVER_SCRIPT={} does not exist",
+            pb.display()
+        ));
+    }
+    // Look relative to the current working directory first (matches the
+    // typical `cd backend && cargo run` flow), then one level up. Forks
+    // running the binary from a different location can set
+    // APP_DATA_SERVER_SCRIPT.
+    let candidates = [
+        std::path::PathBuf::from("data_server/server.py"),
+        std::path::PathBuf::from("../data_server/server.py"),
+    ];
+    for c in candidates {
+        if c.exists() {
+            return Ok(c.canonicalize().unwrap_or(c));
+        }
+    }
+    Err(
+        "data_server/server.py not found. Run the backend from the repo root \
+         (or its `backend/` directory), or set APP_DATA_SERVER_SCRIPT."
+            .to_string(),
+    )
+}
+
+/// If the session has a bound dataset, write the data-server config +
+/// MCP config tempfiles and return a handle describing the CLI flags to
+/// add. Returns `Ok(None)` when no dataset is bound — plain chat mode.
+async fn prepare_python_bridge(
+    state: &AppState,
+    session_id: &str,
+) -> Result<Option<PythonBridgeHandle>, String> {
+    let binding = match state.datasets.binding(session_id).await {
+        Some(b) => b,
+        None => return Ok(None),
+    };
+    let python_bin = resolve_python_bin()?;
+    let script = resolve_data_server_script()?;
+
+    let data_cfg = json!({
+        "dataset_path": binding.path.to_string_lossy(),
+        "format": binding.format,
+        "filename": binding.filename,
+    });
+    let mut data_file = tempfile::NamedTempFile::new()
+        .map_err(|e| format!("creating data-server config: {e}"))?;
+    std::io::Write::write_all(&mut data_file, data_cfg.to_string().as_bytes())
+        .map_err(|e| format!("writing data-server config: {e}"))?;
+
+    let mcp_cfg = json!({
+        "mcpServers": {
+            "viz-tools": {
+                "command": python_bin,
+                "args": [script.to_string_lossy()],
+                "env": {
+                    "DATA_SERVER_CONFIG": data_file.path().to_string_lossy(),
+                }
+            }
+        }
+    });
+    let mut mcp_file = tempfile::NamedTempFile::new()
+        .map_err(|e| format!("creating mcp config: {e}"))?;
+    std::io::Write::write_all(&mut mcp_file, mcp_cfg.to_string().as_bytes())
+        .map_err(|e| format!("writing mcp config: {e}"))?;
+
+    let allowed_tools = vec![
+        "mcp__viz-tools__describe_dataset".into(),
+        "mcp__viz-tools__query_dataset".into(),
+        "mcp__viz-tools__create_chart".into(),
+    ];
+
+    let cols_str = binding
+        .columns
+        .iter()
+        .take(50)
+        .map(|c| format!("{} ({})", c.name, c.dtype))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let system_prompt = format!(
+        "You are analyzing the dataset '{filename}' ({rows} rows). Columns: {cols}. \
+         The dataset is available as a SQL table named 'data' via the Python MCP server 'viz-tools'. \
+         Tool guide: \
+         - describe_dataset() — schema + 5 sample rows. Call this before answering if you're unsure of types. \
+         - query_dataset(sql) — read-only SELECT against table 'data'. Use for numeric answers. \
+         - create_chart(sql, mark, x, y, color?, title?) — render a chart inline. Supported marks: line, bar, area, point, tick. \
+         When the question is about a trend, distribution, or comparison, always produce a chart with create_chart. \
+         Interleave short prose with charts: (1) restate the question, (2) call the tool, (3) interpret the result in 1-2 sentences. \
+         Keep SQL simple and aggregate when possible; charts with more than a few hundred points are noisy.",
+        filename = binding.filename,
+        rows = binding.row_count,
+        cols = cols_str,
+    );
+
+    Ok(Some(PythonBridgeHandle {
+        mcp_config_path: mcp_file.path().to_path_buf(),
+        allowed_tools,
+        system_prompt,
+        _data_server_config_file: data_file,
+        _mcp_config_file: mcp_file,
+    }))
 }
 
 /// Cancel a running Claude subprocess by session ID. Looks up the mpsc
@@ -794,6 +1147,10 @@ async fn claude_websocket_handler(socket: WebSocket, state: AppState, cookie_id:
             sessions.len()
         );
     }
+    // NB: we deliberately do *not* drop the dataset binding here — the
+    // frontend opens a fresh WebSocket for every turn, so unbinding on
+    // close would lose the dataset between turns. Bindings are cleared
+    // by the frontend calling POST /api/datasets/unbind on "New chat".
 
     forward_task.abort();
     println!("[TRACE] WebSocket handler ended for session {}", session_id);
@@ -1014,9 +1371,11 @@ async fn execute_claude_command(
         args.push("--session-id".into());
         args.push(cid.clone());
     }
-    // Wire the tool bridge so registered tools appear as MCP tools Claude
-    // can call. The handle stays alive for the duration of this function
-    // (RAII guard cleans up temp files + secret registration on drop).
+    // Wire the Rust tool bridge (registered server/client tools) AND the
+    // Python MCP sidecar (viz-tools: describe_dataset, query_dataset,
+    // create_chart) when the session has a bound dataset. Both handles
+    // stay alive for the duration of this function; their RAII guards
+    // clean up temp files + secret registration on drop.
     let bridge = prepare_tool_bridge(&state, &session_id).await?;
     if let Some(ref b) = bridge {
         args.push("--mcp-config".into());
@@ -1025,6 +1384,15 @@ async fn execute_claude_command(
             args.push("--allowed-tools".into());
             args.push(b.allowed_tools.join(","));
         }
+    }
+    let py_bridge = prepare_python_bridge(&state, &session_id).await?;
+    if let Some(ref pb) = py_bridge {
+        args.push("--mcp-config".into());
+        args.push(pb.mcp_config_path.to_string_lossy().into_owned());
+        args.push("--allowed-tools".into());
+        args.push(pb.allowed_tools.join(","));
+        args.push("--append-system-prompt".into());
+        args.push(pb.system_prompt.clone());
     }
     append_extra_args(&mut args, &extra);
     cmd.args(&args);
@@ -1227,6 +1595,15 @@ async fn continue_claude_command(
             args.push(b.allowed_tools.join(","));
         }
     }
+    let py_bridge = prepare_python_bridge(&state, &session_id).await?;
+    if let Some(ref pb) = py_bridge {
+        args.push("--mcp-config".into());
+        args.push(pb.mcp_config_path.to_string_lossy().into_owned());
+        args.push("--allowed-tools".into());
+        args.push(pb.allowed_tools.join(","));
+        args.push("--append-system-prompt".into());
+        args.push(pb.system_prompt.clone());
+    }
     append_extra_args(&mut args, &extra);
     cmd.args(&args);
     if !project_path.is_empty() {
@@ -1386,6 +1763,15 @@ async fn resume_claude_command(
             args.push("--allowed-tools".into());
             args.push(b.allowed_tools.join(","));
         }
+    }
+    let py_bridge = prepare_python_bridge(&state, &session_id).await?;
+    if let Some(ref pb) = py_bridge {
+        args.push("--mcp-config".into());
+        args.push(pb.mcp_config_path.to_string_lossy().into_owned());
+        args.push("--allowed-tools".into());
+        args.push(pb.allowed_tools.join(","));
+        args.push("--append-system-prompt".into());
+        args.push(pb.system_prompt.clone());
     }
     append_extra_args(&mut args, &extra);
     cmd.args(&args);
@@ -1548,7 +1934,13 @@ pub async fn create_web_server(
         active_bridge_secrets: Arc::new(Mutex::new(std::collections::HashMap::new())),
         pending_client_tools: Arc::new(Mutex::new(std::collections::HashMap::new())),
         self_url,
+        datasets: DatasetStore::default(),
     };
+
+    let upload_limit_bytes: usize = std::env::var("APP_UPLOAD_MAX_BYTES")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(25 * 1024 * 1024);
 
     // CORS policy: browser credentials (cookies) must travel with every
     // request, so we can't use `Any` origin + allow_credentials. Same-origin
@@ -1575,6 +1967,14 @@ pub async fn create_web_server(
             "/api/conversations/{conversation_id}/messages",
             get(load_conversation_messages),
         )
+        // Dataset upload + per-session binding. Upload has its own body
+        // limit (default 25 MB); bind/unbind are small JSON requests.
+        .route(
+            "/api/datasets/upload",
+            post(upload_dataset).layer(DefaultBodyLimit::max(upload_limit_bytes)),
+        )
+        .route("/api/datasets/bind", post(bind_dataset))
+        .route("/api/datasets/unbind", post(unbind_dataset))
         // Internal: called by the tool-bridge subprocess via loopback only.
         // Protected by the per-spawn X-Tool-Bridge-Secret header.
         .route("/__tools/dispatch", axum::routing::post(tools_dispatch))

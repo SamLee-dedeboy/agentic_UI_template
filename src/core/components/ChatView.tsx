@@ -1,8 +1,9 @@
-import { useEffect, useMemo, useRef } from "react";
+import { useEffect, useMemo, useRef, type ReactNode } from "react";
 import {
   useClaudeSession,
   type ClaudeMessage,
   type PendingToolCall,
+  type UseClaudeSessionReturn,
 } from "@/core/hooks/useClaudeSession";
 import { PromptInput } from "@/core/components/PromptInput";
 import { ThemeToggle } from "@/core/components/ThemeToggle";
@@ -20,13 +21,60 @@ import { Button } from "@/components/ui/button";
  * paired with the originating `tool_use` block via (name, input) match
  * so the picker renders in conversation flow, not as a dock.
  *
- * This is the seam forks edit most. Swap bubble styling, add avatars,
- * add rich tool-result cards, etc. The logical core (message projection,
- * pending-call correlation, tool-call routing) stays here and in
- * `useClaudeSession`.
+ * Forks can either pass their own `session` (owned by a parent that
+ * needs to layer in dataset state, upload buttons, etc.) or let the
+ * view create one internally. The optional `composerLeftAdornment`,
+ * `aboveComposer`, `renderEmptyState`, `onBeforeSend`, and `onReset`
+ * hooks let a parent splice in extra UI + behavior without forking
+ * this file.
  */
-export function ChatView({ model }: { model?: string }) {
-  const session = useClaudeSession({ model });
+export interface ChatViewProps {
+  model?: string;
+  /** Externally-owned session. When omitted, the view creates one. */
+  session?: UseClaudeSessionReturn;
+  /** Extra nodes rendered next to the theme toggle in the header. */
+  headerExtra?: ReactNode;
+  /** Rendered inside the PromptInput, left of the textarea. */
+  composerLeftAdornment?: ReactNode;
+  /** Rendered between the messages list and the composer. */
+  aboveComposer?: ReactNode;
+  /** Override the default empty-state content. */
+  renderEmptyState?: (ctx: { onPick: (prompt: string) => void }) => ReactNode;
+  /**
+   * Called before `session.send`. Useful for side effects that must
+   * complete first (e.g. bind a dataset to the session). Throwing
+   * aborts the send.
+   */
+  onBeforeSend?: (prompt: string) => Promise<void> | void;
+  /** Called after `session.reset`. */
+  onReset?: () => void;
+}
+
+export function ChatView(props: ChatViewProps = {}) {
+  // Split: when the caller owns the session, skip creating a second one.
+  // When they don't, create one in a child component so we still obey
+  // the Rules of Hooks (the hook call is unconditional inside the
+  // branch that runs it).
+  if (props.session) {
+    return <ChatViewInner {...props} session={props.session} />;
+  }
+  return <ChatViewSelfOwned {...props} />;
+}
+
+function ChatViewSelfOwned(props: ChatViewProps) {
+  const session = useClaudeSession({ model: props.model });
+  return <ChatViewInner {...props} session={session} />;
+}
+
+function ChatViewInner({
+  session,
+  headerExtra,
+  composerLeftAdornment,
+  aboveComposer,
+  renderEmptyState,
+  onBeforeSend,
+  onReset,
+}: ChatViewProps & { session: UseClaudeSessionReturn }) {
   const running = session.status === "running";
 
   const turns = useMemo(() => projectTurns(session.messages), [session.messages]);
@@ -45,10 +93,7 @@ export function ChatView({ model }: { model?: string }) {
     return m;
   }, [turns]);
 
-  // Set of `tool_use.id`s that already have a `tool_result`. Used to
-  // stop rendering the live input component once Claude has received a
-  // result for that call (either because the user resolved it or the
-  // backend timed out).
+  // Set of `tool_use.id`s that already have a `tool_result`.
   const resolvedToolUseIds = useMemo(() => {
     const s = new Set<string>();
     for (const t of turns) {
@@ -61,14 +106,7 @@ export function ChatView({ model }: { model?: string }) {
   }, [turns]);
 
   // Correlate each pending client-tool call to a `tool_use` block by
-  // matching tool name + JSON-equal input. FIFO on both sides, so two
-  // pending calls of the same tool with the same input get paired in
-  // insertion order (rare but defensive).
-  //
-  // The two IDs are unrelated on the wire — backend-generated
-  // `tool_call_id` vs. Claude-generated `tool_use.id` — so we need this
-  // matching pass to render the live component alongside the right
-  // bubble. See docs/tools.md for the full id story.
+  // matching tool name + JSON-equal input.
   const pendingByToolUseId = useMemo(() => {
     const out = new Map<string, PendingToolCall>();
     const used = new Set<string>();
@@ -93,9 +131,8 @@ export function ChatView({ model }: { model?: string }) {
     return out;
   }, [turns, session.pendingToolCalls, resolvedToolUseIds]);
 
-  // Safety net: if a `tool_result` arrived for a pending call (e.g. the
-  // backend timed out and Claude got an error result), the live
-  // component would otherwise sit forever. Drop the pending entry.
+  // Safety net: drop pending client-tool calls whose `tool_result` has
+  // already arrived from Claude.
   useEffect(() => {
     const toRemove: string[] = [];
     for (const p of session.pendingToolCalls) {
@@ -107,7 +144,6 @@ export function ChatView({ model }: { model?: string }) {
       }
     }
     for (const id of toRemove) session.removePendingToolCall(id);
-    // `session.removePendingToolCall` is stable (useCallback).
   }, [
     pendingByToolUseId,
     resolvedToolUseIds,
@@ -120,6 +156,26 @@ export function ChatView({ model }: { model?: string }) {
     endRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
   }, [turns.length, session.pendingToolCalls.length, running]);
 
+  const handleSubmit = async (prompt: string) => {
+    if (onBeforeSend) {
+      try {
+        await onBeforeSend(prompt);
+      } catch (err) {
+        console.error("[ChatView] onBeforeSend rejected", err);
+        return;
+      }
+    }
+    session.send(prompt);
+  };
+
+  const handleReset = () => {
+    // Run onReset *first* so callers can observe the old sessionId (to
+    // unbind server-side state, cancel requests, etc.) before the hook
+    // rotates it.
+    onReset?.();
+    session.reset();
+  };
+
   return (
     <div className="mx-auto flex h-full w-full max-w-3xl flex-col">
       <header className="flex items-center justify-between border-b px-4 py-2">
@@ -127,8 +183,9 @@ export function ChatView({ model }: { model?: string }) {
           session {session.sessionId.slice(0, 8)} · {session.status}
         </div>
         <div className="flex items-center gap-1">
+          {headerExtra}
           {turns.length > 0 && (
-            <Button variant="ghost" size="sm" onClick={session.reset}>
+            <Button variant="ghost" size="sm" onClick={handleReset}>
               New chat
             </Button>
           )}
@@ -138,7 +195,11 @@ export function ChatView({ model }: { model?: string }) {
 
       <div className="flex-1 overflow-y-auto px-4 py-4 space-y-3">
         {turns.length === 0 && (
-          <EmptyState suggestions={suggestionsFor(session)} onPick={session.send} />
+          renderEmptyState ? (
+            renderEmptyState({ onPick: handleSubmit })
+          ) : (
+            <DefaultEmptyState onPick={handleSubmit} />
+          )
         )}
         {turns.map((t) => (
           <TurnBubble
@@ -150,12 +211,7 @@ export function ChatView({ model }: { model?: string }) {
             onResolve={session.resolveToolCall}
           />
         ))}
-        {/* Show the thinking animation while a prompt is in flight and
-            no assistant turn has started yet (i.e., Claude hasn't
-            produced a text/tool_use block for this turn). */}
-        {running && turns[turns.length - 1]?.role === "user" && (
-          <ThinkingBubble />
-        )}
+        {running && turns[turns.length - 1]?.role === "user" && <ThinkingBubble />}
         <div ref={endRef} />
       </div>
 
@@ -165,11 +221,14 @@ export function ChatView({ model }: { model?: string }) {
         </pre>
       )}
 
+      {aboveComposer}
+
       <PromptInput
-        onSubmit={session.send}
+        onSubmit={handleSubmit}
         onCancel={session.cancel}
         disabled={running}
         running={running}
+        leftAdornment={composerLeftAdornment}
       />
     </div>
   );
@@ -177,22 +236,11 @@ export function ChatView({ model }: { model?: string }) {
 
 // ---------------------------------------------------------------------------
 // Message → turn projection.
-// Stream-json arrives as a flat sequence of {type: "user"|"assistant"|...}.
-// For display we group contiguous entries into "turns" and extract the
-// rendering-relevant bits.
 // ---------------------------------------------------------------------------
 
 type Turn =
-  | {
-      role: "user";
-      key: number;
-      text: string;
-    }
-  | {
-      role: "assistant";
-      key: number;
-      blocks: AssistantBlock[];
-    };
+  | { role: "user"; key: number; text: string }
+  | { role: "assistant"; key: number; blocks: AssistantBlock[] };
 
 type AssistantBlock =
   | { kind: "text"; text: string }
@@ -334,9 +382,7 @@ function AssistantBlockView({
   }
   if (block.kind === "tool_result") {
     const toolName = toolNameById.get(block.tool_use_id);
-    const ResultComponent = toolName
-      ? toolResultRegistry[toolName]
-      : undefined;
+    const ResultComponent = toolName ? toolResultRegistry[toolName] : undefined;
     const parsed = parseToolResultContent(block.content);
 
     if (ResultComponent) {
@@ -359,17 +405,11 @@ function AssistantBlockView({
   return null;
 }
 
-/** Strip the MCP server prefix (`mcp__template-tools__`) off a tool name. */
+/** Strip the MCP server prefix (`mcp__<server>__`) off a tool name. */
 function stripMcpPrefix(name: string): string {
   return name.replace(/^mcp__[^_]+(?:__)?/, "");
 }
 
-/**
- * Order-stable JSON stringify used to compare tool inputs across
- * Claude's stream-json and the backend's `tool_call_for_ui` payload.
- * Object key order isn't guaranteed to match across the two paths, so
- * sort before stringifying.
- */
 function stableStringify(value: unknown): string {
   return JSON.stringify(value, sortedReplacer);
 }
@@ -385,13 +425,6 @@ function sortedReplacer(_key: string, value: unknown): unknown {
   return value;
 }
 
-/**
- * The wire shape of `tool_result.content` is either a plain string or
- * an array of content blocks like `[{type:"text", text:"<json>"}]`
- * (the bridge currently always emits the array form). Flatten to a
- * single text preview, then try to parse as JSON so custom renderers
- * get a structured value.
- */
 function parseToolResultContent(raw: unknown): {
   value: unknown;
   preview: string;
@@ -411,137 +444,56 @@ function parseToolResultContent(raw: unknown): {
   }
 }
 
-function EmptyState({
-  suggestions,
-  onPick,
-}: {
-  suggestions: string[];
-  onPick: (prompt: string) => void;
-}) {
+function DefaultEmptyState({ onPick }: { onPick: (prompt: string) => void }) {
+  const suggestions = [
+    "What questions can I ask about this dataset?",
+    "Summarize the dataset: what columns and what trends stand out?",
+    "Show me the distribution of the most important numeric column.",
+  ];
   return (
     <div className="mx-auto flex w-full max-w-2xl flex-col gap-6 py-8">
       <div className="space-y-1 text-center">
         <h1 className="text-2xl font-semibold tracking-tight">
-          Claude UI Template
+          Agentic Visualization
         </h1>
         <p className="text-sm text-muted-foreground">
-          A chat where Claude calls your tools and your React components render
-          the results.
+          Upload a CSV or JSON dataset, then ask a question. Claude will
+          interleave charts and explanations in the same bubble.
         </p>
       </div>
-
-      <div className="grid gap-3 sm:grid-cols-3">
-        <ExplainCard
-          title="Server tools"
-          body="Rust handlers Claude invokes over MCP. Declare the schema + handler in one place."
-          file="backend/src/main.rs"
-          example="b.server_tool(&quot;get_weather&quot;, …)"
-        />
-        <ExplainCard
-          title="Client tools"
-          body="React components that render inline in chat. resolve(value) returns a tool result."
-          file="src/main.tsx"
-          example="registerClientTool(&quot;show_choice&quot;, ShowChoice)"
-        />
-        <ExplainCard
-          title="Chat shell"
-          body="This view. Owns the WebSocket session, streams stream-json into bubbles."
-          file="src/core/components/ChatView.tsx"
-          example="const s = useClaudeSession()"
-        />
-      </div>
-
       <div className="rounded-lg border bg-card p-4 text-sm">
-        <div className="mb-2 font-medium">How a turn flows</div>
+        <div className="mb-2 font-medium">How it works</div>
         <ol className="list-decimal space-y-1 pl-5 text-muted-foreground">
-          <li>You send a prompt from the input below.</li>
+          <li>Click <b>Dataset</b> in the composer to upload a file.</li>
           <li>
-            Backend spawns <code className="font-mono text-xs">claude</code>{" "}
-            with <code className="font-mono text-xs">--mcp-config</code>{" "}
-            pointing at <code className="font-mono text-xs">tool-bridge</code>.
+            Ask a data question — e.g.{" "}
+            <span className="italic">"what's the trend of car prices?"</span>
           </li>
           <li>
-            Claude decides to call a tool. Server tools run in Rust; client
-            tools round-trip to this browser.
-          </li>
-          <li>
-            Stream-json flows back over WebSocket and renders as bubbles
-            (text, thinking, tool_use, tool_result).
+            Claude calls{" "}
+            <code className="font-mono text-xs">describe_dataset</code>,{" "}
+            <code className="font-mono text-xs">query_dataset</code>, and{" "}
+            <code className="font-mono text-xs">create_chart</code> (Python
+            MCP server) and streams prose + charts back.
           </li>
         </ol>
       </div>
-
       <div className="flex flex-col gap-2">
         <div className="text-center text-xs uppercase tracking-wide text-muted-foreground">
           Try a prompt
         </div>
-        <div className="flex flex-col gap-2">
-          {suggestions.map((s) => (
-            <Button
-              key={s}
-              variant="outline"
-              size="sm"
-              className="justify-start"
-              onClick={() => onPick(s)}
-            >
-              {s}
-            </Button>
-          ))}
-        </div>
-        <p className="text-center text-xs text-muted-foreground">
-          Suggestions exercise the three example tools:{" "}
-          <code className="font-mono">get_weather</code> (server),{" "}
-          <code className="font-mono">show_choice</code> (client), and the{" "}
-          <code className="font-mono">search_flights</code> +{" "}
-          <code className="font-mono">show_flight_options</code> pair
-          (server → client).
-        </p>
-      </div>
-
-      <div className="border-t pt-4 text-center text-xs text-muted-foreground">
-        Edit <code className="font-mono">src/App.tsx</code> and save — Vite HMR
-        reloads instantly. See{" "}
-        <code className="font-mono">docs/tools.md</code> for the full tool
-        guide, <code className="font-mono">CLAUDE.md</code> for architecture.
+        {suggestions.map((s) => (
+          <Button
+            key={s}
+            variant="outline"
+            size="sm"
+            className="justify-start"
+            onClick={() => onPick(s)}
+          >
+            {s}
+          </Button>
+        ))}
       </div>
     </div>
   );
-}
-
-function ExplainCard({
-  title,
-  body,
-  file,
-  example,
-}: {
-  title: string;
-  body: string;
-  file: string;
-  example: string;
-}) {
-  return (
-    <div className="flex flex-col gap-2 rounded-lg border bg-card p-3 text-left">
-      <div className="text-sm font-medium">{title}</div>
-      <p className="text-xs text-muted-foreground">{body}</p>
-      <div className="mt-auto space-y-1">
-        <div className="truncate font-mono text-[11px] text-muted-foreground">
-          {file}
-        </div>
-        <pre className="overflow-x-auto rounded bg-muted/60 p-1.5 font-mono text-[11px] leading-snug">
-          {example}
-        </pre>
-      </div>
-    </div>
-  );
-}
-
-// One suggestion per shipped reference tool / tool-pair. A fork that
-// swaps the registry should swap these too so the empty state stays
-// useful.
-function suggestionsFor(_: ReturnType<typeof useClaudeSession>): string[] {
-  return [
-    "What's the weather like in Tokyo?",
-    "Help me pick a color for a new website: blue, green, or purple.",
-    "Find me flights from SFO to Tokyo on 2026-05-10.",
-  ];
 }

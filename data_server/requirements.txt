@@ -1,0 +1,4 @@
+mcp>=1.2.0
+pandas>=2.0.0
+duckdb>=0.10.0
+altair>=5.2.0

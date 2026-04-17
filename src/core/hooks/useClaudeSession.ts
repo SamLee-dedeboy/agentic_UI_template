@@ -59,7 +59,9 @@ export interface UseClaudeSessionOptions {
   extra?: Record<string, unknown>;
 }
 
-export function useClaudeSession(opts: UseClaudeSessionOptions) {
+export type UseClaudeSessionReturn = ReturnType<typeof useClaudeSession>;
+
+export function useClaudeSession(opts: UseClaudeSessionOptions = {}) {
   // Session ID is state, not memo: `reset()` regenerates it so a new
   // chat gets a fresh backend session (different sessionId => the WS
   // handler, conversation row, pending-tool maps, and cancel channel
