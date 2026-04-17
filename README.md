@@ -1,185 +1,165 @@
-# Claude-UI template
+# Agentic Visualization
 
-A starter template for building **customer-facing, Claude-powered vertical
-apps**. Fork this repo, register a handful of domain tools, swap in your
-UI components, and you have a chat app where Claude calls your tools and
-your React components render the results.
+An agentic data-visualization app: upload a CSV or JSON dataset, ask a
+question in chat, and Claude replies with interleaved prose and
+Vega-Lite charts rendered inline in the same bubble.
 
-The scenario: a flight-ticketing company wants an agentic booking flow —
-users type "I want to fly to Tokyo next Friday", Claude searches for
-flights via your backend API, and your `<FlightResults>` component
-renders the options. User clicks "Book option 2", Claude reserves the
-seat, collects payment, sends confirmation. That's the shape this
-template scaffolds — and the template ships a working end-to-end demo
-of exactly that flow.
+```
+you:    what's the trend of car prices over time?
+
+Claude: I'll start by looking at what columns are available…
+        [describe_dataset → cars.csv: year, price, mileage, make]
+        Prices have risen steadily since 2018. Here's the trend:
+        ┌──────────────── Avg price by year ────────────────┐
+        │   •                                                 │
+        │        •                                            │
+        │            •                                        │
+        │                 •                                   │
+        │                       •                             │
+        └─────────────────────────────────────────────────────┘
+        The steepest jump is between 2020 and 2022 — likely the
+        pandemic-era supply crunch.
+```
+
+The template ships Rust orchestration, a Python MCP sidecar for data
+tools, and a React chat UI with `react-vega`. Fork it to build any
+domain-specific agentic-viz app (product analytics, finance dashboards,
+ML eval explorers, etc.).
 
 > Derived from [`getAsterisk/opcode`](https://github.com/getAsterisk/opcode).
-> Rewritten as a web-only, customer-facing agentic-app scaffold on top of
+> Pivoted from a generic tools template into a viz-focused app on top of
 > Claude Code 2.x.
+
+## Architecture at a glance
+
+```
+┌──────────────┐   stream-json      ┌─────────────────┐   MCP stdio   ┌──────────────┐
+│  Browser     │◄─ WebSocket ─────  │  Axum backend   │◄────────────▶│  claude CLI  │
+│  ChatView    │                    │  (Rust)         │               │  subprocess  │
+│  react-vega  │   /api/datasets/*  │                 │               │              │
+│              │◄── REST ─────────▶ │  dataset store  │               │              │
+└──────────────┘                    │                 │    stdio      ┌──────────────┐
+                                    │  spawns …       │◄─────────────▶│ data_server  │
+                                    └─────────────────┘    MCP        │ (Python)     │
+                                                                      │ pandas+DuckDB│
+                                                                      │ +Altair      │
+                                                                      └──────────────┘
+```
+
+- **Rust backend** owns HTTP/WebSocket, session cookies, dataset upload
+  + binding, and the Claude subprocess.
+- **Python MCP sidecar** ([data_server/](data_server/)) owns the data
+  tools. Loads the bound dataset into pandas + DuckDB (as SQL table
+  `data`), exposes `describe_dataset`, `query_dataset(sql)`, and
+  `create_chart(sql, mark, x, y, …)`. Altair emits the Vega-Lite spec.
+- **React frontend** renders the chat, uploads datasets, and paints
+  `create_chart` tool results with `react-vega` inline in the bubble.
+  Interleaving is free: `<ChatView>` already renders text / tool_use /
+  tool_result blocks in order inside one bubble.
+
+See [CLAUDE.md](CLAUDE.md) for the full architecture writeup.
 
 ## What you get
 
-- **Rust backend** (Axum) that spawns the Claude Code CLI as a subprocess
-  per conversation turn, streams `--output-format stream-json` back to
-  the browser over WebSocket, and persists every message to SQLite keyed
-  by a signed guest-session cookie.
-- **Tool bridge**: a companion Rust binary (`tool-bridge`) that speaks
-  the MCP protocol. Forks register domain tools in one place; the bridge
-  exposes them to Claude and routes invocations back to either a Rust
-  handler (server tools) or a React component (client tools).
-- **Three working example tools** that demo the whole stack end-to-end:
-  - `get_weather` — server tool, calls the free [Open-Meteo](https://open-meteo.com) API (no key).
-  - `show_choice` — client tool, renders multiple-choice buttons.
-  - `search_flights` + `show_flight_options` — paired server → client tool
-    that generates deterministic flight data per route and renders a
-    flight picker.
-- **React 19 + Vite** frontend with generative-UI chat, live markdown
-  rendering (tables, code, lists via `remark-gfm`), a "Claude is
-  thinking" bouncing-dots loader, and a light/dark theme toggle.
-- **Tool-result renderers** — each example tool has a custom result
-  component (`WeatherResultCard`, `ChoiceResultCard`,
-  `FlightPickResultCard`) so results look like domain UI, not raw JSON.
-  Forks register their own via `registerToolResult(name, Component)`.
+- **Dataset upload** with schema sniffing (CSV or JSON array-of-objects,
+  up to 25 MB by default), cookie-scoped ownership, tempfile storage.
+- **Three Python tools** exposed over MCP to Claude:
+  `describe_dataset`, `query_dataset`, `create_chart`. Read-only SQL;
+  chart specs are pure Vega-Lite JSON.
+- **Inline chart rendering** via `react-vega` with ResizeObserver-based
+  sizing, transparent background, and axis/legend colors that inherit
+  from the app's light/dark theme.
 - **Guest-session cookies** with HMAC-signed values, per-cookie rate
-  limits (messages-per-minute and concurrent-conversations), and
-  persistent conversation history. No user accounts required to start;
-  forks swap in real auth at the `cookies.rs` seam.
+  limits, and persistent conversation history in SQLite.
 - **Safe defaults**: Claude spawns with `--tools ""` (no filesystem, no
-  bash) and `--dangerously-skip-permissions` off. Customer apps don't
-  expose host filesystem access; only the tools you register.
-
-## The core abstraction: tools as UI
-
-A **tool** has a name, an input schema, and a handler. The handler is
-either server-side Rust (hits a DB, calls an API, charges a card) or
-client-side React (renders a component, waits for user input, returns
-the user's choice as the result). Claude sees both kinds uniformly via
-a single MCP bridge the template ships.
-
-```
-┌──────────────┐   stream-json     ┌─────────────────┐   MCP stdio   ┌──────────────┐
-│  Browser     │◄────────────────  │  Axum + tool    │─────────────▶ │  claude CLI  │
-│  ChatView    │                   │  registry       │               │  subprocess  │
-│  React tool  │   tool_call_for_ui│                 │               │              │
-│  registry    │◄──── WebSocket ──▶│  tool-bridge    │◄─ tools/call ─│              │
-│              │   tool_result_    │  child (spawned │               │              │
-│              │   from_ui         │  alongside)     │               │              │
-└──────────────┘                   └─────────────────┘               └──────────────┘
-```
-
-A user prompt flows through Claude → Claude decides to call a tool →
-the bridge forwards to the main server → the server either runs Rust
-or round-trips through the WebSocket for UI rendering → the result
-flows back through the bridge → Claude responds in natural language.
-
-**Server tool example** (`backend/src/main.rs` + `backend/src/examples/weather.rs`):
-
-```rust
-// main.rs
-b.server_tool(
-    "get_weather",
-    "Return the current weather for a city. …",
-    json!({ "type": "object", "properties": { "location": {"type":"string"} }, "required": ["location"] }),
-    |input| async move { examples::weather::fetch(input).await },
-);
-
-// examples/weather.rs — real handler, ~100 lines, calls Open-Meteo
-pub async fn fetch(input: Value) -> Result<Value> { /* geocode + forecast */ }
-```
-
-**Client tool example** (three pieces):
-
-1. Declare on the backend so Claude knows the tool exists:
-   ```rust
-   b.client_tool("show_choice", "Ask the user to pick one.", json!({ ... }));
-   ```
-2. Register the React component that renders it:
-   ```tsx
-   // src/main.tsx
-   import { registerClientTool } from "@/core/tools/registry";
-   import { ShowChoice } from "@/core/tools/builtins/ShowChoice";
-   registerClientTool("show_choice", ShowChoice);
-   ```
-3. Optionally, register a custom result renderer so Claude's response
-   shows a domain card instead of raw JSON:
-   ```tsx
-   import { registerToolResult } from "@/core/tools/registry";
-   import { ChoiceResultCard } from "@/core/tools/builtins/ChoiceResultCard";
-   registerToolResult("show_choice", ChoiceResultCard);
-   ```
-
-The component receives `input` and a `resolve(result)` callback. When
-the user clicks a button, the component invokes `resolve(...)`; the
-template ships the result back to Claude as the `tool_result`. Claude
-uses it on the next turn.
-
-See [docs/tools.md](docs/tools.md) for the full guide.
+  bash); only the MCP tools you register are available. SQL is guarded
+  to SELECT/WITH only and runs in in-memory DuckDB with no disk access.
+- **Rust tool surface preserved**: the old Rust MCP `tool-bridge` and
+  `ToolRegistry` are still in the tree, just unused by default. Forks
+  that want to mix Rust-side tools alongside the Python ones re-enable
+  them by registering tools in [backend/src/main.rs](backend/src/main.rs).
 
 ## Prerequisites
 
-- **[Claude Code CLI](https://claude.ai/code)** on the server host (must be
-  on `PATH`, or set `APP_CLAUDE_BINARY=/abs/path/to/claude`).
+- **[Claude Code CLI](https://claude.ai/code)** on `PATH`, or
+  `APP_CLAUDE_BINARY=/abs/path/to/claude`.
 - **[Bun](https://bun.sh)** 1.3+ and **Rust** 1.70+ with cargo.
+- **Python 3.10+** (the `mcp` package requires it).
 
 ## Running it
 
+### 1. Install
+
 ```bash
 bun install
-bun run build           # produces dist/
-cd backend
-cargo build --bins      # builds claude-ui-app + tool-bridge (debug; add --release for prod)
-cargo run --bin claude-ui-app   # http://127.0.0.1:8080
+
+# Python MCP server deps — see data_server/README.md for the venv walk-through.
+python3 -m venv data_server/.venv
+source data_server/.venv/bin/activate
+pip install --upgrade pip
+pip install -r data_server/requirements.txt
 ```
 
-Two-process dev loop with HMR:
+Point the backend at the venv's Python so MCP spawns find their deps:
 
 ```bash
-# Terminal 1 — backend on :8080, auto-rebuilds on .rs save
-cargo install cargo-watch          # optional, one-time
+# Either activate the venv before `cargo run`
+source data_server/.venv/bin/activate
+
+# …or set APP_PYTHON_BINARY explicitly (persistable in your shell rc)
+export APP_PYTHON_BINARY="$(pwd)/data_server/.venv/bin/python"
+```
+
+### 2. One-process prod run
+
+```bash
+bun run build                          # compiles frontend into dist/
+cd backend
+cargo build --bins                     # builds claude-ui-app + tool-bridge
+cargo run --bin claude-ui-app          # http://127.0.0.1:8080
+```
+
+### 3. Two-process dev loop (HMR)
+
+```bash
+# Terminal 1 — backend on :8080 (auto-rebuilds on Rust saves with cargo-watch)
 cd backend && cargo watch -x "run --bin claude-ui-app"
 
 # Terminal 2 — frontend on :1420 with HMR, proxies /api + /ws to :8080
 bun run dev
 ```
 
-Open http://localhost:1420. The empty-state panel explains the template
-and offers three suggestion prompts — one per example tool.
+Open http://localhost:1420. Click **Dataset** in the composer, upload a
+CSV, and ask a data question. A good first prompt against the included
+fixture ([data_server/tests/fixtures/cars.csv](data_server/tests/fixtures/cars.csv)):
 
-> **New here?** Read [docs/README.md](docs/README.md) for a step-by-step
-> walkthrough of the template using the three shipped example tools.
+> *what's the trend of car prices over time?*
 
-> **Important when editing Rust code.** The running backend keeps its
-> binary in memory — rebuilding writes a new binary but doesn't hot-swap.
-> After any backend change: stop the process (Ctrl+C), rebuild, restart,
-> and click "New chat" in the UI so Claude's cached tool results from
-> the stale context don't replay.
-
-## Mental model (if you're coming from Node)
-
-| You're used to                 | Here, it's                                              |
-| ------------------------------ | ------------------------------------------------------- |
-| Express / Fastify              | **Axum** (Rust). Router, handlers, state                |
-| `fetch(...)` or axios          | `apiCall(command, params)` from `@/core/apiAdapter`     |
-| `nodemon`                      | `cargo watch -x "run --bin claude-ui-app"`              |
-| `vite dev` with HMR            | Same. `bun run dev` on `:1420`, proxies `/api` + `/ws`  |
-| Session cookies via `express-session` | `backend/src/core/cookies.rs` (HMAC-signed)       |
-| Vercel AI SDK `streamUI`       | The tool registry + `tool_call_for_ui` WebSocket dance  |
+> **After editing backend Rust code.** Stop the running process
+> (Ctrl+C), `cargo build --bins`, restart, and click "New chat" in the
+> UI. A running backend keeps its binary mmapped; Claude also caches
+> tool context inside a chat so a new chat flushes that state. Python
+> edits (`data_server/*.py`) take effect on the next turn automatically
+> — no backend restart needed.
 
 ## Configuration
 
-| Env var                           | Default | Effect                                                                                       |
-| --------------------------------- | ------- | -------------------------------------------------------------------------------------------- |
-| `APP_SESSION_KEY`                 | random  | HMAC key for the `session=` cookie. **Set this in production** or sessions reset on restart. |
-| `APP_DB_PATH`                     | `~/.claude-ui-app/app.db` | SQLite file for conversations + messages.                        |
-| `APP_COOKIE_SECURE`               | `0`     | Set `1` when fronting with TLS so the cookie gets `Secure`.                                  |
-| `APP_MAX_MSGS_PER_MIN`            | `30`    | Per-cookie message rate.                                                                     |
-| `APP_MAX_CONCURRENT_CONVS`        | `5`     | Per-cookie concurrent-conversation cap.                                                      |
-| `APP_CLIENT_TOOL_TIMEOUT_SECS`    | `120`   | How long the backend waits for a UI tool result before failing the call.                     |
-| `APP_CLAUDE_BINARY`               | _unset_ | Explicit `claude` binary path.                                                               |
-| `APP_TOOL_BRIDGE_PATH`            | _derived_ | Override the `tool-bridge` binary location.                                                |
-| `APP_ALLOW_SKIP_PERMISSIONS`      | `0`     | Set `1` for internal-dev-tool forks that want Claude's full built-in toolset.                |
+| Env var                           | Default | Effect                                                                                          |
+| --------------------------------- | ------- | ----------------------------------------------------------------------------------------------- |
+| `APP_SESSION_KEY`                 | random  | HMAC key for the `session=` cookie. **Set this in production** or sessions reset on restart.    |
+| `APP_DB_PATH`                     | `~/.claude-ui-app/app.db` | SQLite file for conversation persistence.                           |
+| `APP_COOKIE_SECURE`               | `0`     | Set `1` when fronting with TLS so the cookie gets `Secure`.                                     |
+| `APP_MAX_MSGS_PER_MIN`            | `30`    | Per-cookie message-rate ceiling.                                                                |
+| `APP_MAX_CONCURRENT_CONVS`        | `5`     | Per-cookie concurrent-conversation cap.                                                         |
+| `APP_UPLOAD_MAX_BYTES`            | `26214400` (25 MB) | Multipart body limit for `POST /api/datasets/upload`.                                |
+| `APP_CLIENT_TOOL_TIMEOUT_SECS`    | `120`   | Client-tool round-trip timeout (only matters if you add Rust client tools).                     |
+| `APP_CLAUDE_BINARY`               | _unset_ | Explicit `claude` binary path.                                                                  |
+| `APP_PYTHON_BINARY`               | `python3` on PATH | Python interpreter used to spawn the MCP sidecar. Point at your venv.                 |
+| `APP_DATA_SERVER_SCRIPT`          | `data_server/server.py` (relative to CWD or `../`) | Override the MCP server script location.       |
+| `APP_TOOL_BRIDGE_PATH`            | _derived_ | Override the `tool-bridge` binary (only matters if you re-enable Rust tools).                 |
+| `APP_ALLOW_SKIP_PERMISSIONS`      | `0`     | Set `1` to let Claude use its built-in filesystem/bash tools. Don't do this in customer-facing deploys. |
 
-CLI flags on the main binary:
+CLI:
 
 ```
 claude-ui-app --host 127.0.0.1 --port 8080
@@ -188,73 +168,79 @@ claude-ui-app --host 127.0.0.1 --port 8080
 ## Project layout
 
 ```
-src/                                       # Frontend (React 19 + Vite)
-  App.tsx                                  # the seam you rewrite — defaults to <ChatView>
-  main.tsx                                 # registers client tools + tool-result renderers
-  core/
-    apiAdapter.ts                          # REST + WebSocket + tool_result_from_ui + closeSession
-    hooks/
-      useClaudeSession.ts                  # stream-json → state, pending-tool queue, reset
-      useTheme.ts                          # light/dark toggle, localStorage-backed
+src/                                       # Frontend (React + Vite)
+  App.tsx                                  # owns session + dataset state, wires ChatView slots
+  main.tsx                                 # registerToolResult("create_chart", ChartResultCard)
+  core/                                    # stable plumbing — keep shape-compatible
+    apiAdapter.ts                          # REST + WebSocket helpers
+    hooks/useClaudeSession.ts              # stream-json → state, pending-tool queue, reset
+    hooks/useTheme.ts                      # light/dark toggle, localStorage-backed
     components/
-      ChatView.tsx                         # default customer-facing chat
-      SessionRunner.tsx                    # lower-level primitive, no bubbles
-      MessageList.tsx, PromptInput.tsx     # primitives
-      PendingToolCalls.tsx                 # dock-style tool-call renderer
-      Markdown.tsx                         # react-markdown + GFM wrapper
-      ThinkingBubble.tsx                   # bouncing-dots "Claude is thinking" loader
-      ThemeToggle.tsx                      # sun/moon icon button
-    tools/
-      registry.ts                          # clientToolRegistry + toolResultRegistry + helpers
-      builtins/                            # ShowChoice, FlightResults,
-                                           #   WeatherResultCard, ChoiceResultCard,
-                                           #   FlightPickResultCard
-  components/ui/                           # shadcn/ui primitives (Radix)
-  lib/utils.ts
+      ChatView.tsx                         # bubble chat; accepts session + slot props
+      PromptInput.tsx                      # composer; leftAdornment slot for upload button
+      ThinkingBubble.tsx, ThemeToggle.tsx, Markdown.tsx
+    tools/registry.ts                      # clientToolRegistry + toolResultRegistry + helpers
+    tools/builtins/                        # empty in the default template; forks add reference components here
+  features/                                # viz surface (fork-editable)
+    datasets/                              # upload button + chip + REST client
+    viz/ChartResultCard.tsx                # react-vega renderer for create_chart results
 
 backend/                                   # Rust (Axum) + MCP bridge
   src/
-    main.rs                                # builds the ToolRegistry, starts the server
-    web_server.rs                          # HTTP routes, WebSocket, Claude spawn, dispatch
-    examples/                              # reference tool implementations
-      weather.rs                           #   live Open-Meteo call
-      flights.rs                           #   deterministic procedural generator
+    main.rs                                # empty ToolRegistry by default; forks add Rust tools here
+    web_server.rs                          # HTTP routes, WebSocket, Claude spawn, Python + Rust bridge
     core/
-      tools.rs                             # ToolRegistry, server/client tool runtimes
-      stream.rs                            # typed stream-json decoder
-      cookies.rs                           # HMAC-signed guest-session cookies
-      conversations.rs                     # SQLite-backed message persistence
-      ratelimit.rs                         # per-cookie budgets
-    bin/tool_bridge.rs                     # MCP stdio shim spawned alongside Claude
-    commands/                              # plain-Rust helpers used by web_server
-    claude_binary.rs                       # binary discovery (nvm/homebrew/npm/PATH)
-    process/registry.rs                    # in-memory process tracking
+      datasets.rs                          # DatasetStore, CSV/JSON schema inference
+      tools.rs                             # ToolRegistry (unchanged; for forks)
+      cookies.rs, conversations.rs, ratelimit.rs, stream.rs
+    bin/tool_bridge.rs                     # Rust MCP stdio shim — retained for forks
+
+data_server/                               # Python MCP sidecar
+  server.py                                # describe_dataset, query_dataset, create_chart
+  requirements.txt                         # mcp, pandas, duckdb, altair
+  README.md                                # setup + standalone testing
+  tests/fixtures/cars.csv                  # fixture for smoke tests
 
 docs/
-  README.md                                # hands-on walkthrough, start here
-  tools.md                                 # deep dive on tool registration + plumbing
+  README.md                                # hands-on walkthrough (start here after this file)
+  tools.md                                 # deep dive on the ToolRegistry (for Rust-tool forks)
+
+CLAUDE.md                                  # architecture notes for Claude Code itself
 ```
 
-## Known gaps / next steps
+## Extending
 
-- **No history replay on mount.** The backend persists everything; the
-  frontend doesn't yet load it. Straightforward addition: call
+- **Add more Python tools**: edit [data_server/server.py](data_server/server.py).
+  Register in the `TOOLS` list + implement in `_call_tool`. Add a
+  front-end `registerToolResult(name, Component)` in
+  [src/main.tsx](src/main.tsx) if you want a custom result bubble.
+- **Add Rust tools alongside Python**: register them in
+  [backend/src/main.rs](backend/src/main.rs) via
+  `b.server_tool(...)` / `b.client_tool(...)`. They'll be exposed
+  through the Rust `tool-bridge` MCP server alongside the Python
+  `viz-tools` server. See [docs/tools.md](docs/tools.md).
+- **Rebrand**: swap the empty-state copy in [src/App.tsx](src/App.tsx)
+  and the page title in [index.html](index.html).
+
+## Known gaps
+
+- **No history replay on mount.** Conversations persist to SQLite, but
+  the frontend doesn't load prior messages on refresh. Add a call to
   `/api/conversations/:id/messages` in `useClaudeSession`'s mount
-  effect. Left as an exercise because the right UX (auto-resume vs.
-  conversation picker) is fork-specific.
-- **Shared-secret auth moved out of the default path.** Forks that need
-  real OAuth / SSO should replace `cookies.rs` rather than extend it.
-- **No horizontal scaling.** Rate limits and pending-tool-call maps are
-  in-process. Multi-instance deployments need Redis or similar.
-- **Tool schemas are hand-written JSON Schema.** Forks that want
-  type-safety can layer `schemars` on top; we kept the core template
-  dep-light.
-- **Pending ↔ tool_use correlation is heuristic.** The frontend matches
-  a pending client-tool call to its `tool_use` block by `(name, input)`
-  equality because backend-generated `tool_call_id` and Claude's
-  `tool_use.id` aren't linked on the wire. Breaks only if Claude emits
-  two identical calls in one turn — add a tool_use_id to the dispatch
-  payload if you need that.
+  effect if you need it.
+- **Dataset store is in-memory.** Process restart drops uploads; per-cookie
+  ownership is enforced but multi-instance deploys need external
+  storage (S3, Redis, or a shared FS + locking).
+- **Python process is re-spawned per turn.** Each Claude turn re-reads
+  the CSV into pandas — fine for ≤25 MB, but add a long-lived daemon
+  with a socket if you need warm-start on larger datasets.
+- **Chart sizing is ResizeObserver-based.** `width: "container"` in
+  Vega-Lite doesn't recover from an initial 0-width measurement;
+  [ChartResultCard](src/features/viz/ChartResultCard.tsx) measures the
+  wrapper itself and passes a numeric width into the spec.
+- **SQL safety is belt-and-suspenders.** `query_dataset` refuses
+  non-SELECT via token matching; DuckDB is in-memory so writes are also
+  physically blocked. Don't rely on one layer alone.
 
 ## License
 

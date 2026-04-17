@@ -1,234 +1,217 @@
 # Getting started
 
-A hands-on walkthrough of the template using the three example tools it
-ships with. Follow this once, top to bottom, and you'll understand how
-to add your own.
+A hands-on walkthrough of the agentic-viz template. Follow this once
+top to bottom and you'll understand how to extend the Python MCP data
+tools, the React chart renderer, and the dataset lifecycle.
 
-- Looking for the high-level pitch, configuration reference, and
-  architecture diagrams? → [main README](../README.md).
-- Looking for a deep dive on tool plumbing and conventions? →
+- High-level pitch, configuration reference, architecture diagram? →
+  [main README](../README.md).
+- Adding Rust-side tools alongside the Python MCP sidecar? →
   [docs/tools.md](./tools.md).
+- Python sidecar internals (install, standalone testing, SQL safety)?
+  → [data_server/README.md](../data_server/README.md).
 
 ## 1. Run the template
 
-Prerequisites: [Bun](https://bun.sh) 1.3+, Rust 1.70+ with cargo, and
-the [Claude Code CLI](https://claude.ai/code) on `PATH`.
+Prerequisites: [Bun](https://bun.sh) 1.3+, Rust 1.70+, the
+[Claude Code CLI](https://claude.ai/code) on `PATH`, **Python 3.10+**.
 
 ```bash
+# JS + Rust deps
 bun install
-bun run build                      # compiles the frontend into dist/
+
+# Python MCP sidecar deps (in a venv)
+python3 -m venv data_server/.venv
+source data_server/.venv/bin/activate
+pip install --upgrade pip
+pip install -r data_server/requirements.txt
+
+# Build + run
+bun run build
 cd backend
-cargo build --bins                 # builds claude-ui-app + tool-bridge
-cargo run --bin claude-ui-app      # serves on http://127.0.0.1:8080
+cargo build --bins
+cargo run --bin claude-ui-app          # http://127.0.0.1:8080
 ```
 
-Open the URL. The welcome panel explains server tools, client tools,
-and the chat shell, plus three trigger prompts — one per shipped tool.
+> **Point the backend at the venv's Python.** The Rust backend spawns
+> Python on each Claude turn. Either activate the venv in the same
+> shell before `cargo run`, or export
+> `APP_PYTHON_BINARY="$(pwd)/../data_server/.venv/bin/python"`. If you
+> forget this, the default `python3` on PATH doesn't have `mcp` and
+> Claude quietly sees no viz tools.
 
-> **After editing any Rust file under `backend/src/`**: stop the running
-> process (Ctrl+C), `cargo build --bins` again, restart, and click
-> "New chat" in the UI. The running backend has its binary loaded in
-> memory and won't pick up rebuilds otherwise; within a chat, Claude
-> caches prior tool results in context so stale state can mask the fix.
+Open http://127.0.0.1:8080. The empty-state panel nudges you to upload
+a dataset.
 
-## 2. Trace the server-tool example: `get_weather`
+## 2. Upload a dataset
 
-Click **"What's the weather like in Tokyo?"**. Here's what happens.
+Click **Dataset** in the composer and pick a CSV or a JSON array-of-
+objects (≤ 25 MB). A fixture lives at
+[data_server/tests/fixtures/cars.csv](../data_server/tests/fixtures/cars.csv)
+— 15 rows with `year, price, mileage, make` columns.
 
-**Declaration** — [backend/src/main.rs](../backend/src/main.rs):
+What happens:
 
-```rust
-b.server_tool(
-    "get_weather",
-    "Return the current weather for a city. …",
-    json!({ "type": "object", "properties": { "location": { "type": "string" } }, "required": ["location"] }),
-    |input| async move { examples::weather::fetch(input).await },
-);
-```
+1. Browser POSTs the file to `/api/datasets/upload` (multipart).
+2. Backend writes it to `$TMPDIR/claude-ui-ds-<uuid>.csv` and parses
+   column names + 5 sample rows + row count with the `csv` crate.
+3. Backend returns `{dataset_id, filename, format, row_count, columns, sample_rows}`.
+4. Frontend stashes the id and renders the `DatasetChip` above the
+   composer.
 
-**Implementation** — [backend/src/examples/weather.rs](../backend/src/examples/weather.rs):
-a real call to the free [Open-Meteo](https://open-meteo.com) API (no
-key required). Geocodes the city, fetches current weather, maps WMO
-weather codes to human summaries.
+Backend surface: [backend/src/web_server.rs](../backend/src/web_server.rs)
+`upload_dataset()`; schema inference:
+[backend/src/core/datasets.rs](../backend/src/core/datasets.rs).
 
-**What happens when you send the prompt:**
+Frontend surface:
+[src/features/datasets/DatasetUploadButton.tsx](../src/features/datasets/DatasetUploadButton.tsx)
+and [src/features/datasets/api.ts](../src/features/datasets/api.ts).
 
-1. The browser opens a WebSocket and sends your prompt.
-2. The backend spawns `claude` with `--mcp-config` pointing at the
-   `tool-bridge` binary.
-3. Claude reads the tool description, decides to call `get_weather`
-   with `{ "location": "Tokyo" }`.
-4. The bridge forwards the call to `/__tools/dispatch` on the main
-   server. The Rust handler runs, hits Open-Meteo, returns JSON.
-5. Claude gets the JSON as a `tool_result`, writes a natural-language
-   reply. The `WeatherResultCard` component renders the tool result as
-   a card with an icon + temperature instead of raw JSON.
+## 3. Ask a data question
 
-Try the same prompt with a different city — "Oslo", "Mumbai", "São
-Paulo" — and you'll get real, different weather each time.
+With `cars.csv` uploaded, try:
 
-**Make it yours:** swap the Open-Meteo call for your weather provider.
-Only the body of `examples::weather::fetch` changes; the rest of the
-plumbing — schema validation, MCP wiring, result-card rendering — stays
-exactly the same.
+> *what's the trend of car prices over time?*
 
-## 3. Trace the client-tool example: `show_choice`
+What happens, end to end:
 
-Click **"Help me pick a color for a new website: blue, green, or
-purple."**. Claude calls a *client* tool — one where the handler is a
-React component, not Rust.
+1. **Bind the dataset to the session.** Before the prompt is sent,
+   `App.tsx` POSTs `/api/datasets/bind` with `{session_id, dataset_id}`
+   (see [src/App.tsx](../src/App.tsx) `handleBeforeSend`).
+2. **Open a WebSocket** and send the prompt
+   ([src/core/apiAdapter.ts](../src/core/apiAdapter.ts)).
+3. **Spawn Claude.** The backend notices the session has a bound
+   dataset and calls `prepare_python_bridge` ([web_server.rs](../backend/src/web_server.rs)),
+   which writes two tempfiles:
+   - An MCP config pointing at `python data_server/server.py`, with the
+     Python binary resolved via `APP_PYTHON_BINARY`.
+   - A data-server config with `{dataset_path, format, filename}`
+     passed to the Python process via `DATA_SERVER_CONFIG` env var.
+   It also injects an `--append-system-prompt` summarizing the dataset
+   schema so Claude knows what columns exist without having to ask.
+4. **Python MCP server boots.** Reads the config, loads the CSV into a
+   pandas DataFrame, registers it with DuckDB as SQL table `data`,
+   announces three tools over stdio: `describe_dataset`,
+   `query_dataset`, `create_chart`.
+5. **Claude calls tools.** Typical flow for a trend question:
+   1. `describe_dataset()` → schema + sample rows confirm column types.
+   2. `query_dataset("SELECT year, AVG(price) FROM data GROUP BY year ORDER BY year")`
+      → Claude inspects the aggregate.
+   3. `create_chart({ sql: "SELECT year, AVG(price) AS avg_price FROM data GROUP BY year ORDER BY year", mark: "line", x: {field: "year", type: "ordinal"}, y: {field: "avg_price", type: "quantitative"}, title: "Avg price by year" })`
+      → Python runs the SQL, builds an Altair chart, calls
+      `.to_dict()`, returns `{vega_lite_spec, summary, row_count}`.
+6. **Frontend renders.** `<ChatView>` already renders text /
+   `tool_use` / `tool_result` blocks in order within one bubble, so
+   interleaving is free. `create_chart`'s result hits the custom
+   renderer registered in [src/main.tsx](../src/main.tsx):
+   [ChartResultCard](../src/features/viz/ChartResultCard.tsx) paints
+   the Vega-Lite spec with `react-vega`, sized via ResizeObserver.
 
-Client tools live in **three** places. Understanding why there are
-three is the key to the template.
+## 4. Trace a `create_chart` call in detail
 
-**Place 1** — backend declaration so Claude knows the tool exists.
-[backend/src/main.rs](../backend/src/main.rs):
+Everything above happens in one `tool_result` round-trip. If you want
+to verify the wire:
 
-```rust
-b.client_tool(
-    "show_choice",
-    "Present the user with a short list of choices and wait for them to pick one. …",
-    json!({
+- The backend prints `[TRACE] Command: …` on each spawn — look for the
+  two `--mcp-config` flags (the Rust tool-bridge is empty by default,
+  the Python viz-tools config is the one that matters) and the
+  `--allowed-tools mcp__viz-tools__…,…` line.
+- `data_server/server.py` prints any exception tracebacks to stderr,
+  which the Rust backend forwards to the UI as `error` events (you'll
+  see a red bubble above the composer).
+- In the browser DevTools, inspect the `<svg>` inside the chart card:
+  it should have `width="~500"` and a real `viewBox`. If it's width=0,
+  reload the tab — [ChartResultCard](../src/features/viz/ChartResultCard.tsx)
+  remeasures on mount via ResizeObserver but a stale first render can
+  persist across hot reloads.
+
+## 5. Extend: add a new Python data tool
+
+Say you want a `column_stats` tool that returns mean / std / quantiles
+for a numeric column. Two files to touch:
+
+**[data_server/server.py](../data_server/server.py)** — register + implement:
+
+```python
+TOOLS.append(types.Tool(
+    name="column_stats",
+    description="Return mean, std, min, max, and quartiles for a numeric column.",
+    inputSchema={
         "type": "object",
-        "properties": {
-            "prompt":  { "type": "string" },
-            "options": { "type": "array", "items": { "type": "string" }, "minItems": 2 }
-        },
-        "required": ["prompt", "options"]
-    }),
-);
+        "properties": {"column": {"type": "string"}},
+        "required": ["column"],
+        "additionalProperties": False,
+    },
+))
+
+def _column_stats(column: str) -> dict:
+    series = DF[column]
+    desc = series.describe()
+    return {"column": column, "stats": json.loads(desc.to_json())}
+
+# In _call_tool:
+elif name == "column_stats":
+    result = _column_stats(args["column"])
 ```
 
-No handler! Client tools don't have a Rust handler; their handler is
-the React component.
+**[backend/src/web_server.rs](../backend/src/web_server.rs)** — add the
+tool to the `allowed_tools` list in `prepare_python_bridge` so Claude
+can auto-invoke it without permission prompts:
 
-**Place 2** — the React component that renders the tool.
-[src/core/tools/builtins/ShowChoice.tsx](../src/core/tools/builtins/ShowChoice.tsx):
-
-```tsx
-export function ShowChoice({ input, resolve }: ClientToolProps<...>) {
-  return (
-    <div>
-      <p>{input.prompt}</p>
-      {input.options.map((opt, i) => (
-        <Button key={i} onClick={() => resolve({ index: i, value: opt })}>
-          {opt}
-        </Button>
-      ))}
-    </div>
-  );
-}
+```rust
+let allowed_tools = vec![
+    "mcp__viz-tools__describe_dataset".into(),
+    "mcp__viz-tools__query_dataset".into(),
+    "mcp__viz-tools__create_chart".into(),
+    "mcp__viz-tools__column_stats".into(),   // new
+];
 ```
 
-Two props: `input` (the object Claude passed, matching the schema
-above) and `resolve(value)` (the function you call with the result).
-Calling `resolve` is what returns a `tool_result` to Claude.
+Rebuild the backend, click "New chat", and Claude will pick up the new
+tool from the next `tools/list`. Python edits hot-apply per turn — no
+Python restart required.
 
-**Place 3** — wire the component to the tool name, and optionally add a
-result renderer for a nicer confirmation bubble.
+Optionally, register a custom result bubble in
 [src/main.tsx](../src/main.tsx):
 
 ```tsx
-registerClientTool("show_choice", ShowChoice);
-registerToolResult("show_choice", ChoiceResultCard); // optional
+registerToolResult("column_stats", ColumnStatsCard);
 ```
 
-The string must match the name in `b.client_tool(...)` exactly.
+Without one, the result falls back to a collapsed JSON preview in
+[ChatView](../src/core/components/ChatView.tsx), which is fine for
+tools Claude just reads off — no UI required.
 
-**What happens when you send the prompt:**
+## 6. Extend: add a Rust-side tool alongside Python
 
-1. Claude calls `show_choice` with
-   `{ "prompt": "Pick a color", "options": ["blue", "green", "purple"] }`.
-2. The bridge forwards the call to `/__tools/dispatch` like before —
-   but this time the main server sees it's a client tool, so it
-   generates a `tool_call_id`, parks a `oneshot::Sender`, and pushes a
-   `tool_call_for_ui` event down the WebSocket.
-3. The chat view pairs the pending call to the preceding `tool_use`
-   block (matching by tool name + input equality, since backend's
-   `tool_call_id` and Claude's `tool_use.id` aren't linked on the wire)
-   and renders `<ShowChoice>` inline with `input` + `resolve` wired up.
-4. You click a button. `resolve({ index: 1, value: "green" })` fires.
-5. The browser sends `tool_result_from_ui` back over the WebSocket.
-   The backend wakes the parked oneshot; the original HTTP dispatch
-   returns; the bridge hands the result to Claude.
-6. Claude writes "Green it is — shall I…" and the stream continues.
-   `ChoiceResultCard` renders the resolved tool_result as a green-check
-   pill.
+Some tools don't need Python (API calls, DB lookups, business logic).
+Register them in [backend/src/main.rs](../backend/src/main.rs) via
+`b.server_tool(...)` / `b.client_tool(...)` — they become available
+through the Rust `tool-bridge` MCP server in addition to the Python
+`viz-tools` server. See [docs/tools.md](./tools.md) for the full
+server-vs-client decision matrix and the exact schema + handler shape.
 
-If you don't click within `APP_CLIENT_TOOL_TIMEOUT_SECS` (default
-120 s), Claude gets a timeout error and the card renders a "Selected
-(unknown)" fallback so the UI stays sensible.
+## 7. Rebrand for your fork
 
-## 4. Trace the paired example: `search_flights` → `show_flight_options`
+To make this your own:
 
-Click **"Find me flights from SFO to Tokyo on 2026-05-10."**. This one
-exercises the full pattern: a domain **server tool** produces data,
-then Claude calls a **client tool** to have the user pick from it.
-
-1. Claude calls `search_flights({ origin: "SFO", destination: "Tokyo",
-   date: "2026-05-10" })`. The handler
-   ([backend/src/examples/flights.rs](../backend/src/examples/flights.rs))
-   is a deterministic procedural generator seeded by the input — same
-   query always returns the same three flights, different queries
-   diverge. No paid aggregator required for the demo.
-2. Claude reads the result and calls
-   `show_flight_options({ origin, destination, date, flights })`. The
-   `<FlightResults>` component renders a card per flight with airline,
-   flight number, times, duration, stops, cabin, and a "Select" button.
-3. You click "Select" on a flight. `resolve({ picked_id, picked_flight })`
-   fires; the result flows back to Claude; Claude confirms.
-   `<FlightPickResultCard>` renders the picked flight as a summary.
-
-Run the same prompt with different routes — JFK → LHR, Paris →
-Bangkok — and you'll see different airlines (Air Canada, Lufthansa,
-ANA, Emirates, …) and prices/times per route. IATA codes for ~30
-common cities are resolved; anything else falls back to the first three
-letters of the name.
-
-## 5. Modify an example
-
-Two quick experiments to build intuition.
-
-**A. Swap weather providers.** Open
-[backend/src/examples/weather.rs](../backend/src/examples/weather.rs),
-replace the Open-Meteo URLs with your preferred API (AccuWeather,
-Pirate Weather, whatever), return the same JSON shape. Rebuild, restart,
-click "New chat", run the Tokyo prompt again. The rest of the stack
-doesn't notice.
-
-**B. Add a "business class only" filter to flights.** Edit
-`examples::flights::search` to take an optional `cabin` argument (you'd
-also add it to the schema in `main.rs`), filter the generator output.
-Claude will pick up the new field from the description and pass it
-when relevant.
-
-## 6. Build your app
-
-To replace the examples with real tools:
-
-1. Delete the `get_weather`, `show_choice`, `search_flights`,
-   `show_flight_options` registrations from
-   [backend/src/main.rs](../backend/src/main.rs). Register your own
-   `server_tool(...)` and `client_tool(...)` calls in the same
-   `build_tool_registry()` function.
-2. Delete `backend/src/examples/` (or leave as reference) and add your
-   own domain module.
-3. Replace the `src/core/tools/builtins/*.tsx` components with your own
-   under `src/features/<your-app>/`. Register via `registerClientTool`
-   and `registerToolResult` in `src/main.tsx`.
-4. Tweak the empty-state copy in
-   [src/core/components/ChatView.tsx](../src/core/components/ChatView.tsx)
-   so the suggested prompts exercise *your* tools, not the defaults.
-5. Swap the page title in [index.html](../index.html).
+1. Update the empty-state copy in [src/App.tsx](../src/App.tsx)
+   (`<EmptyState>`) so the suggestions describe your domain.
+2. Swap the page title in [index.html](../index.html).
+3. Edit the system prompt in `prepare_python_bridge`
+   ([backend/src/web_server.rs](../backend/src/web_server.rs)) if your
+   domain needs different guidance for Claude (e.g., "always include a
+   95% CI", "never aggregate across regions", etc.).
+4. Add fork-specific tools under `data_server/` or in `backend/src/`
+   per the extension guides above.
 
 ## Where to go next
 
-- **[Main README](../README.md)** — configuration env vars, project
-  layout, prerequisites, known gaps.
-- **[docs/tools.md](./tools.md)** — the complete tool reference:
-  server vs client decision matrix, schema conventions, end-to-end
-  flow with the exact WebSocket/HTTP frames, tool-result renderers,
-  and debugging tips.
-- **[CLAUDE.md](../CLAUDE.md)** — architecture notes, CLI invocation
-  shape, gotchas. Primarily for Claude Code itself when working on
-  this repo, but useful for humans too.
+- **[Main README](../README.md)** — configuration reference, project
+  layout, prerequisites.
+- **[data_server/README.md](../data_server/README.md)** — Python
+  sidecar install, standalone testing, SQL safety guarantees.
+- **[docs/tools.md](./tools.md)** — deep reference for adding Rust
+  server/client tools (still valid; the plumbing is unchanged).
+- **[CLAUDE.md](../CLAUDE.md)** — architecture notes for Claude Code
+  itself when working on this repo.
