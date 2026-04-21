@@ -202,9 +202,9 @@ also add it to the schema in `main.rs`), filter the generator output.
 Claude will pick up the new field from the description and pass it
 when relevant.
 
-## 6. Build your app
+## 6. Build your prototype
 
-To replace the examples with real tools:
+To replace the examples with your research tools:
 
 1. Delete the `get_weather`, `show_choice`, `search_flights`,
    `show_flight_options` registrations from

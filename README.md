@@ -1,17 +1,17 @@
 # Claude-UI template
 
-A starter template for building **customer-facing, Claude-powered vertical
-apps**. Fork this repo, register a handful of domain tools, swap in your
-UI components, and you have a chat app where Claude calls your tools and
-your React components render the results.
+A starter template for building **research prototypes of Claude-powered
+agentic UIs**. Fork this repo, register a handful of domain tools, swap in
+your UI components, and you have a chat app where Claude calls your tools
+and your React components render the results.
 
-The scenario: a flight-ticketing company wants an agentic booking flow —
-users type "I want to fly to Tokyo next Friday", Claude searches for
-flights via your backend API, and your `<FlightResults>` component
-renders the options. User clicks "Book option 2", Claude reserves the
-seat, collects payment, sends confirmation. That's the shape this
-template scaffolds — and the template ships a working end-to-end demo
-of exactly that flow.
+The scenario: you're prototyping a generative-UI chat — the kind where
+Claude calls your domain tools and your React components render the
+results inline — and you want to run it past real participants without
+spending a week wiring up the substrate. That's the shape this template
+scaffolds. It ships three worked example tools (weather, multiple-choice,
+flight search + picker) so you can trace the full loop end-to-end before
+swapping in your own.
 
 ![Weather and flight-search tools rendering inline in chat](docs/Screenshot%202026-04-20%20at%2021.22.53.png)
 
@@ -44,17 +44,19 @@ of exactly that flow.
   Forks register their own via `registerToolResult(name, Component)`.
 - **Guest-session cookies** with HMAC-signed values, per-cookie rate
   limits (messages-per-minute and concurrent-conversations), and
-  persistent conversation history. No user accounts required to start;
-  forks swap in real auth at the `cookies.rs` seam.
-- **Safe defaults**: Claude spawns with `--tools ""` (no filesystem, no
-  bash) and `--dangerously-skip-permissions` off. Customer apps don't
-  expose host filesystem access; only the tools you register.
+  persistent conversation history. Lets you run user studies or share a
+  demo URL without setting up accounts; swap in real auth at the
+  `cookies.rs` seam when the prototype graduates.
+- **Sandboxed defaults**: Claude spawns with `--tools ""` (no filesystem,
+  no bash) and `--dangerously-skip-permissions` off, so participants only
+  see the tools you register. Flip `APP_ALLOW_SKIP_PERMISSIONS=1` when
+  your prototype needs Claude's full built-in toolset.
 
 ## The core abstraction: tools as UI
 
 A **tool** has a name, an input schema, and a handler. The handler is
-either server-side Rust (hits a DB, calls an API, charges a card) or
-client-side React (renders a component, waits for user input, returns
+either server-side Rust (calls an API, runs a computation, logs an event)
+or client-side React (renders a component, waits for user input, returns
 the user's choice as the result). Claude sees both kinds uniformly via
 a single MCP bridge the template ships.
 
@@ -179,7 +181,7 @@ and offers three suggestion prompts — one per example tool.
 | `APP_CLIENT_TOOL_TIMEOUT_SECS`    | `120`   | How long the backend waits for a UI tool result before failing the call.                     |
 | `APP_CLAUDE_BINARY`               | _unset_ | Explicit `claude` binary path.                                                               |
 | `APP_TOOL_BRIDGE_PATH`            | _derived_ | Override the `tool-bridge` binary location.                                                |
-| `APP_ALLOW_SKIP_PERMISSIONS`      | `0`     | Set `1` for internal-dev-tool forks that want Claude's full built-in toolset.                |
+| `APP_ALLOW_SKIP_PERMISSIONS`      | `0`     | Set `1` for research prototypes that need Claude's full built-in toolset.                    |
 
 CLI flags on the main binary:
 
@@ -244,8 +246,9 @@ docs/
   `/api/conversations/:id/messages` in `useClaudeSession`'s mount
   effect. Left as an exercise because the right UX (auto-resume vs.
   conversation picker) is fork-specific.
-- **Shared-secret auth moved out of the default path.** Forks that need
-  real OAuth / SSO should replace `cookies.rs` rather than extend it.
+- **Shared-secret auth moved out of the default path.** If your prototype
+  graduates to a product and you need real OAuth / SSO, replace
+  `cookies.rs` rather than extending it.
 - **No horizontal scaling.** Rate limits and pending-tool-call maps are
   in-process. Multi-instance deployments need Redis or similar.
 - **Tool schemas are hand-written JSON Schema.** Forks that want
