@@ -13,6 +13,8 @@ seat, collects payment, sends confirmation. That's the shape this
 template scaffolds — and the template ships a working end-to-end demo
 of exactly that flow.
 
+![Weather and flight-search tools rendering inline in chat](docs/Screenshot%202026-04-20%20at%2021.22.53.png)
+
 > Derived from [`getAsterisk/opcode`](https://github.com/getAsterisk/opcode).
 > Rewritten as a web-only, customer-facing agentic-app scaffold on top of
 > Claude Code 2.x.
